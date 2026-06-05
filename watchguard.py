@@ -54,6 +54,11 @@ _DB = _DATA / "watchguard.db"
 _LOG = _RUN / "watchguard.log"
 _ALLOW_FILE = _DATA / "watchguard_allow.txt"
 _FILES_BASELINE = _DATA / "watchguard_files.json"
+# Known-device registry: maps a trusted IP to a human-readable label so both we
+# and Marion know WHO a source is ("iPhone 14 Plus d'Oz") instead of a bare IP /
+# cryptic reverse-DNS name. Lives separately from the allowlist so it survives
+# allowlist rewrites (save_allow only persists bare IPs).
+_DEVICES_FILE = _DATA / "watchguard_devices.json"
 
 # Ports we consider "ours" / sensitive (the JARVIS backend + the dev/avatar
 # servers). Override with WATCHGUARD_PORTS="8340,5173".
@@ -198,6 +203,120 @@ def _rdns(ip: str) -> str:
         return ""
 
 
+def load_labels() -> dict[str, str]:
+    """IP -> friendly device name, from the known-device registry."""
+    try:
+        if _DEVICES_FILE.exists():
+            data = json.loads(_DEVICES_FILE.read_text())
+            return {str(k): str(v) for k, v in data.items() if v}
+    except Exception:
+        pass
+    return {}
+
+
+def describe(ip: str, labels: dict[str, str] | None = None) -> str:
+    """Best human label for a source: registry name > reverse-DNS > bare IP."""
+    labels = load_labels() if labels is None else labels
+    if ip in labels:
+        return f"{labels[ip]} ({ip})"
+    host = _rdns(ip)
+    return f"{host} ({ip})" if host else ip
+
+
+# ---------------------------------------------------------------------------
+# Provenance analysis — "where did this unknown source come from?"
+# ---------------------------------------------------------------------------
+
+def _http_json(url: str, timeout: float = 4.0) -> dict:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "JARVIS-WatchGuard"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+
+
+def _geoip(ip: str) -> dict:
+    """Geolocate + identify the network owner of a PUBLIC ip (free, no key).
+    Returns {} for private/CGNAT/loopback (geo-IP only works on routable IPs)."""
+    try:
+        if ipaddress.ip_address(ip).is_global is False:
+            return {}
+    except Exception:
+        return {}
+    fields = "status,country,regionName,city,isp,org,as,reverse,proxy,hosting,mobile"
+    d = _http_json(f"http://ip-api.com/json/{ip}?fields={fields}")
+    return d if d.get("status") == "success" else {}
+
+
+def _arp_vendor(ip: str) -> tuple[str, str]:
+    """For a LAN ip, resolve (mac, hardware-vendor) from the ARP table.
+    Vendor lookup is best-effort via the OUI (manufacturer) API, no key."""
+    mac = ""
+    try:
+        res = subprocess.run(["arp", "-n", ip], capture_output=True, text=True, timeout=4)
+        m = re.search(r"([0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5})", res.stdout, re.I)
+        if m:
+            mac = ":".join(p.zfill(2) for p in m.group(1).split(":")).lower()
+    except Exception:
+        pass
+    vendor = ""
+    if mac:
+        try:
+            req = urllib.request.Request(f"https://api.macvendors.com/{mac}",
+                                         headers={"User-Agent": "JARVIS-WatchGuard"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                vendor = r.read().decode("utf-8", "replace").strip()
+        except Exception:
+            vendor = ""
+    return mac, vendor
+
+
+def analyze_ip(ip: str, labels: dict[str, str] | None = None) -> dict:
+    """Full provenance dossier for a source IP. Network calls are best-effort
+    and time-boxed, so a slow/offline lookup never blocks the monitor for long."""
+    kind = classify(ip)
+    host = _rdns(ip)
+    lbl = (load_labels() if labels is None else labels).get(ip, "")
+    lines: list[str] = []           # detail lines (log / notification / DB)
+    spoken_bits: list[str] = []     # extra phrasing for Marion
+
+    if lbl:
+        lines.append(f"known device: {lbl}")
+    if host:
+        lines.append(f"reverse-DNS: {host}")
+
+    if kind == "external":
+        g = _geoip(ip)
+        if g:
+            loc = ", ".join(p for p in (g.get("city"), g.get("regionName"),
+                                        g.get("country")) if p)
+            if loc:
+                lines.append(f"location: {loc}")
+                spoken_bits.append(f"localisée à {g.get('country') or loc}")
+            net = g.get("org") or g.get("isp") or g.get("as")
+            if net:
+                lines.append(f"network: {net}")
+                spoken_bits.append(f"réseau {g.get('isp') or net}")
+            flags = [f for f, on in (("VPN/proxy", g.get("proxy")),
+                                     ("hosting/datacenter", g.get("hosting")),
+                                     ("mobile", g.get("mobile"))) if on]
+            if flags:
+                lines.append("flags: " + ", ".join(flags))
+                spoken_bits.append("via " + " et ".join(flags))
+        else:
+            lines.append("location: lookup unavailable (offline?)")
+    elif kind == "lan":
+        mac, vendor = _arp_vendor(ip)
+        if mac:
+            lines.append(f"MAC: {mac}" + (f" ({vendor})" if vendor else ""))
+            if vendor:
+                spoken_bits.append(f"un appareil {vendor}")
+
+    return {"kind": kind, "rdns": host, "label": lbl,
+            "lines": lines, "spoken_extra": ". ".join(spoken_bits)}
+
+
 # ---------------------------------------------------------------------------
 # Network connection snapshot
 # ---------------------------------------------------------------------------
@@ -205,29 +324,42 @@ def _rdns(ip: str) -> str:
 _CONN_RE = re.compile(r"(\S+):(\d+)->(\S+):(\d+)")
 
 
-def snapshot_inbound() -> list[tuple[str, int, int]]:
-    """Return [(remote_ip, remote_port, local_port)] for ESTABLISHED connections
-    whose LOCAL port is one of our monitored ports (i.e. inbound to us)."""
-    out: list[tuple[str, int, int]] = []
+def snapshot_inbound() -> list[tuple[str, int, int, str]]:
+    """Return [(remote_ip, remote_port, local_port, state)] for inbound TCP to one
+    of our monitored ports. Includes both live connections (ESTABLISHED) and
+    in-progress attempts (SYN_RECV = a remote SYN we are answering) so we catch
+    something that "tries to connect" even if the handshake never completes."""
+    out: list[tuple[str, int, int, str]] = []
     try:
+        # No -sTCP state filter: lsof aborts on a state name it doesn't know
+        # (e.g. macOS uses SYN_RCVD, Linux SYN_RECV) and would return NOTHING.
+        # We list all TCP and keep the inbound states ourselves, portably.
         res = subprocess.run(
-            ["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED"],
+            ["lsof", "-nP", "-iTCP"],
             capture_output=True, text=True, timeout=10,
         )
     except Exception as e:
         log.debug("lsof failed: %s", e)
         return out
     for line in res.stdout.splitlines():
+        sm = re.search(r"\((ESTABLISHED|SYN_RCVD|SYN_RECV)\)", line)
+        if not sm:        # skip LISTEN / TIME_WAIT / CLOSE_WAIT / etc.
+            continue
         m = _CONN_RE.search(line)
         if not m:
             continue
-        lhost, lport, rhost, rport = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+        # lsof brackets IPv6 literals ("[::1]:5173"); strip so the bare address
+        # matches the allowlist and ipaddress parsing (else ::1 looks "unknown").
+        lhost = m.group(1).strip("[]")
+        rhost = m.group(3).strip("[]")
+        lport, rport = int(m.group(2)), int(m.group(4))
+        state = "SYN_RCVD" if sm.group(1).startswith("SYN") else "ESTABLISHED"
         # Inbound = the LOCAL side is one of our listening ports.
         if lport in _PORTS:
-            out.append((rhost, rport, lport))
+            out.append((rhost, rport, lport, state))
         elif rport in _PORTS:
             # lsof sometimes orders the listening side second.
-            out.append((lhost, lport, rport))
+            out.append((lhost, lport, rport, state))
     return out
 
 
@@ -319,7 +451,7 @@ def _run_monitor() -> None:
             allow.add(own)
         allow.add("192.168.1.26")  # DoorBird intercom (known infra)
         learned = 0
-        for rip, _rport, _lport in snapshot_inbound():
+        for rip, _rport, _lport, _state in snapshot_inbound():
             if rip not in allow:
                 allow.add(rip)
                 learned += 1
@@ -350,7 +482,8 @@ def _run_monitor() -> None:
         try:
             allow = load_allow()  # re-read so --allow takes effect live
             # --- systems: inbound connections ---
-            for rip, rport, lport in snapshot_inbound():
+            labels = load_labels()
+            for rip, rport, lport, state in snapshot_inbound():
                 if is_allowed(rip, allow):
                     continue
                 kind_of = classify(rip)
@@ -359,14 +492,22 @@ def _run_monitor() -> None:
                 key = f"conn:{rip}:{lport}"
                 if not _cool(key):
                     continue
-                host = _rdns(rip)
-                where = f"{host} ({rip})" if host else rip
+                # Run a full provenance analysis on the unknown source.
+                report = analyze_ip(rip, labels=labels)
+                where = describe(rip, labels=labels)
+                attempt = state == "SYN_RCVD"
+                verb = "tried to connect to" if attempt else "connected to"
                 sev = "critical" if kind_of == "external" else "warning"
-                detail = (f"{kind_of.upper()} source {where} connected to port {lport}"
-                          f"{' (JARVIS)' if lport == 8340 else ''}")
-                spoken = ("Attention mon amour, une connexion "
+                head = (f"{kind_of.upper()} source {where} {verb} port {lport}"
+                        f"{' (JARVIS)' if lport == 8340 else ''}")
+                detail = head + ("  ||  " + "  |  ".join(report["lines"])
+                                 if report["lines"] else "")
+                spoken = ("Attention mon amour, une "
+                          + ("tentative de connexion " if attempt else "connexion ")
                           + ("externe" if kind_of == "external" else "inconnue")
-                          + f" vient de toucher le port {lport}.")
+                          + f" vient de toucher le port {lport}"
+                          + (", " + report["spoken_extra"] if report["spoken_extra"] else "")
+                          + ".")
                 alert("connection", sev, where, detail, spoken)
 
             # --- files: integrity ---
@@ -402,9 +543,11 @@ def _run_monitor() -> None:
 
 def _cli_list() -> None:
     allow = load_allow()
+    labels = load_labels()
     print("Trusted sources (allowlist):")
     for a in sorted(allow):
-        print(f"  {a}")
+        tag = f"  — {labels[a]}" if a in labels else ""
+        print(f"  {a}{tag}")
     print(f"\nMonitored ports: {sorted(_PORTS)}   LAN: {_LAN_NET}")
 
 
@@ -418,9 +561,47 @@ def _cli_status(n: int = 20) -> None:
     if not rows:
         print("No events recorded yet.")
         return
+    labels = load_labels()
+    _ip_re = re.compile(r"[0-9a-fA-F:.]*\d[0-9a-fA-F:.]*")
+
+    def _name(src: str) -> str:
+        # Resolve a known-device label for whatever IP the stored source holds,
+        # so old/bare rows show the friendly name too (not just --list).
+        bare = src.strip("[]")
+        if bare in labels:
+            return f"{labels[bare]} ({bare})"
+        for tok in _ip_re.findall(src):
+            if tok in labels:
+                return src.replace(tok, f"{labels[tok]} ({tok})")
+        return src
+
     for r in rows:
         when = datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M:%S")
-        print(f"  {when}  {r['severity'].upper():8s} {r['kind']:10s} {r['source']:24s} {r['detail']}")
+        print(f"  {when}  {r['severity'].upper():8s} {r['kind']:10s} {_name(r['source']):40s} {r['detail']}")
+
+
+def _cli_who() -> None:
+    """Live view: who is connected RIGHT NOW to a monitored port, with the name
+    resolved (known-device label > reverse-DNS > geo) — trusted devices too."""
+    labels = load_labels()
+    allow = load_allow()
+    conns = snapshot_inbound()
+    if not conns:
+        print("No inbound connections to monitored ports right now.")
+        print(f"(Watching ports {sorted(_PORTS)} — open the app / a device to see one.)")
+        return
+    print(f"Live inbound connections ({len(conns)}):")
+    # Collapse duplicate (ip, lport) pairs from multiple sockets.
+    seen: set[tuple[str, int]] = set()
+    for rip, _rport, lport, state in sorted(conns, key=lambda c: (c[0], c[2])):
+        if (rip, lport) in seen:
+            continue
+        seen.add((rip, lport))
+        trust = "trusted" if is_allowed(rip, allow) else "UNKNOWN"
+        rep = analyze_ip(rip, labels=labels)
+        who = describe(rip, labels=labels)
+        extra = ("  —  " + "; ".join(rep["lines"])) if rep["lines"] else ""
+        print(f"  [{trust:7s}] port {lport}  {state:11s}  {who}{extra}")
 
 
 def main() -> int:
@@ -429,6 +610,8 @@ def main() -> int:
     ap.add_argument("--remove", metavar="IP", help="untrust a source and exit")
     ap.add_argument("--list", action="store_true", help="show the allowlist and exit")
     ap.add_argument("--status", action="store_true", help="show recent events and exit")
+    ap.add_argument("--who", action="store_true",
+                    help="show who is connected right now (named) and exit")
     args = ap.parse_args()
 
     if args.allow:
@@ -441,6 +624,8 @@ def main() -> int:
         _cli_list(); return 0
     if args.status:
         _cli_status(); return 0
+    if args.who:
+        _cli_who(); return 0
 
     try:
         _run_monitor()
