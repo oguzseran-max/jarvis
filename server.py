@@ -62,6 +62,7 @@ from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
 import did_avatar
 import spotify_access
 import self_eval
+import perf_monitor
 import plejd_lights
 import doorbird
 
@@ -2267,6 +2268,7 @@ async def lifespan(application: FastAPI):
     # never more than an hour stale; weather/news/screen refresh faster above.
     asyncio.create_task(_hourly_context_refresh())
     self_eval.init()  # continuous self-improvement (Phase 1)
+    perf_monitor.init()  # real-time per-turn telemetry + bug flags (Phase 0)
     log.info("JARVIS server starting")
 
     # Monitor the DoorBird gate intercom: announce + describe visitors on a ring.
@@ -2445,6 +2447,26 @@ async def api_network_scan():
 
     try:
         return JSONResponse(await asyncio.get_event_loop().run_in_executor(None, _run))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/perf/stats")
+async def api_perf_stats():
+    """Real-time voice-loop telemetry for the on-screen HUD (Phase 0): per-stage
+    latency percentiles, warn/bad counts, and the most recent flagged turns."""
+    try:
+        return JSONResponse(perf_monitor.stats(24))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/perf/flags")
+async def api_perf_flags():
+    """Only the flagged turns (slow / off-target / errored) — what Phase 2's
+    autonomous fix loop will consume."""
+    try:
+        return JSONResponse({"flags": perf_monitor.recent_flags(24)})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -3674,10 +3696,16 @@ async def voice_handler(ws: WebSocket):
             if message.get("type") == "websocket.disconnect":
                 break
 
+            # Per-turn telemetry (Phase 0). Lives for this loop iteration; the
+            # binary + text paths both feed the shared TTS/record block below.
+            _trace = None
+
             # ── Audio utterance (binary) → Whisper (forced lang if set) ──
             if message.get("bytes") is not None:
                 forced = voice_state.get("forced_lang")
+                _trace = perf_monitor.start(forced or voice_state.get("lang", ""))
                 text, utter_lang = await transcribe_audio(message["bytes"], lang=forced)
+                _trace.mark("stt")
                 user_text = apply_speech_corrections(text.strip())
                 if not user_text:
                     # Nothing intelligible — return the UI to idle so the mic
@@ -3769,6 +3797,7 @@ async def voice_handler(ws: WebSocket):
                 # ── Legacy/browser STT transcript (English fallback path) ──
                 if msg.get("type") != "transcript" or not msg.get("isFinal"):
                     continue
+                _trace = perf_monitor.start(voice_state.get("lang", "en"))
                 user_text = apply_speech_corrections(msg.get("text", "").strip())
                 utter_lang = "en"
                 if not user_text:
@@ -4277,10 +4306,16 @@ async def voice_handler(ws: WebSocket):
                         response_text = f"{_digest} {response_text}"
                 except Exception:
                     pass
+                # Phase 0: time from end-of-transcription to here = classify +
+                # action + reply generation (the "reason" bucket).
+                if _trace:
+                    _trace.mark("reason")
                 tts = strip_markdown_for_tts(response_text)
                 _lang = voice_state.get("lang", "en")
                 await ws.send_json({"type": "status", "state": "speaking"})
                 audio = await synthesize_speech(tts, lang=_lang)
+                if _trace:
+                    _trace.mark("tts")
                 if audio:
                     # FR/TR personas (Marion): if a live D-ID WebRTC stream is open,
                     # push the Fish audio into it → Marion lip-syncs in real time
@@ -4316,10 +4351,16 @@ async def voice_handler(ws: WebSocket):
                     )
                 except Exception:
                     pass
+                # Phase 0: close the trace → persist timings + live bug flags.
+                if _trace:
+                    _trace.finish(user_text, response_text)
                 last_jarvis_response = response_text
 
             except Exception as e:
                 log.error(f"Error: {e}", exc_info=True)
+                if _trace:
+                    _trace.finish(locals().get("user_text", ""),
+                                  locals().get("response_text", ""), error=str(e))
                 try:
                     fallback = "Something went wrong, sir."
                     audio = await synthesize_speech(fallback)
