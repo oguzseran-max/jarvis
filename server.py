@@ -2017,6 +2017,16 @@ async def health():
     return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
 
 
+@app.get("/api/selfeval/stats")
+async def api_selfeval_stats():
+    """Self-improvement telemetry for the in-app Self-Evolution HUD."""
+    try:
+        return self_eval.stats(24)
+    except Exception:
+        return {"window_h": 24, "total": 0, "by_kind": {}, "recent": [],
+                "vocab_total": 0, "prefs_total": 0, "max_tokens": 140}
+
+
 @app.get("/api/watchguard/stats")
 async def api_watchguard_stats():
     """Live security telemetry for the in-app diagnostic HUD: alert counts by

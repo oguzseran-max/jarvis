@@ -395,6 +395,37 @@ def _as_int(v) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Stats for the in-app "Self-Evolution" HUD
+# ---------------------------------------------------------------------------
+
+def stats(window_hours: int = 24) -> dict:
+    """Improvement telemetry for the dashboard: how many adjustments were
+    auto-applied in the window, by kind, plus the current tuning state."""
+    out = {
+        "window_h": window_hours, "total": 0, "by_kind": {}, "recent": [],
+        "vocab_total": 0, "prefs_total": 0, "max_tokens": get_max_tokens(),
+    }
+    try:
+        since = time.time() - window_hours * 3600
+        with _conn() as c:
+            for r in c.execute(
+                "SELECT kind, COUNT(*) n FROM changes WHERE ts>=? GROUP BY kind", (since,)
+            ):
+                out["by_kind"][r["kind"]] = r["n"]
+                out["total"] += r["n"]
+            out["recent"] = [
+                {"kind": r["kind"], "detail": r["detail"], "ts": r["ts"]}
+                for r in c.execute(
+                    "SELECT kind, detail, ts FROM changes ORDER BY id DESC LIMIT 12")
+            ]
+            out["vocab_total"] = c.execute("SELECT COUNT(*) FROM vocab").fetchone()[0]
+            out["prefs_total"] = c.execute("SELECT COUNT(*) FROM prefs").fetchone()[0]
+    except Exception:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Daily digest — Marion reports what she changed, once per day
 # ---------------------------------------------------------------------------
 
