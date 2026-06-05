@@ -29,6 +29,30 @@ import httpx
 
 log = logging.getLogger("jarvis.spotify")
 
+
+def _load_env_file() -> None:
+    """Load SPOTIFY_* (and any) vars from a sibling .env if present.
+
+    Dependency-free and non-destructive: never overrides a variable already set
+    in the real environment. This makes `python -m spotify_access` work on its
+    own, without requiring python-dotenv or the server to have loaded .env.
+    """
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+    except Exception:
+        pass
+
+
+_load_env_file()
+
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN", "").strip()

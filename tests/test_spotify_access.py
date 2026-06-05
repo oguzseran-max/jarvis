@@ -3,6 +3,7 @@
 No network: the Spotify Web API is faked with a small URL-routing async client.
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -211,6 +212,19 @@ def test_format_now_playing():
     assert format_now_playing(None) == "Nothing is playing at the moment, sir."
     assert format_now_playing(NowPlaying("Get Lucky", "Daft Punk", True)) == "Currently playing Get Lucky by Daft Punk, sir."
     assert format_now_playing(NowPlaying("Get Lucky", "Daft Punk", False)).startswith("Paused on")
+
+
+# --- .env loader -----------------------------------------------------------
+
+def test_load_env_file_sets_missing_without_overriding(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text('SPOTIFY_CLIENT_ID=fromfile\nSPOTIFY_DEVICE_NAME="Marshall"\n# comment\n')
+    monkeypatch.setattr(sp, "__file__", str(tmp_path / "spotify_access.py"))
+    monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
+    monkeypatch.setenv("SPOTIFY_DEVICE_NAME", "Kitchen")  # already set -> must win
+    sp._load_env_file()
+    assert os.environ["SPOTIFY_CLIENT_ID"] == "fromfile"   # filled from file
+    assert os.environ["SPOTIFY_DEVICE_NAME"] == "Kitchen"  # not overridden
 
 
 # --- .env writer -----------------------------------------------------------
