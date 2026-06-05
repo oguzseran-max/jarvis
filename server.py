@@ -2416,6 +2416,39 @@ async def api_watchguard_announce(payload: dict, request: Request):
     return {"ok": True}
 
 
+@app.get("/api/network/inventory")
+async def api_network_inventory():
+    """Latest LAN inventory for the network-map dashboard (frontend/public/
+    network.html). Produced by tools/lan_scan.py; returns 404 until first scan."""
+    inv = Path(__file__).resolve().parent / "data" / "lan_inventory.json"
+    if inv.exists():
+        try:
+            return JSONResponse(json.loads(inv.read_text()))
+        except Exception:
+            pass
+    return JSONResponse({"error": "no inventory yet — run tools/lan_scan.py"},
+                        status_code=404)
+
+
+@app.post("/api/network/scan")
+async def api_network_scan():
+    """Trigger a fresh LAN scan (the vendor cache makes re-scans quick) and return
+    the updated inventory. The blocking scan runs in a thread executor."""
+    import subprocess as _sp
+    root = Path(__file__).resolve().parent
+    tool = root / "tools" / "lan_scan.py"
+
+    def _run():
+        _sp.run([sys.executable, str(tool)], cwd=str(root),
+                capture_output=True, timeout=180)
+        return json.loads((root / "data" / "lan_inventory.json").read_text())
+
+    try:
+        return JSONResponse(await asyncio.get_event_loop().run_in_executor(None, _run))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/api/tts-test")
 async def tts_test():
     """Generate a test audio clip for debugging."""
