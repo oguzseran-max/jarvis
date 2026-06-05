@@ -22,8 +22,8 @@ interface WgStats {
 
 const CSS = `
 #sec-hud {
-  position: fixed; left: 22px; top: 50%; transform: translateY(-50%);
-  width: 270px; z-index: 4; pointer-events: none;
+  position: fixed; right: 22px; top: 22px;
+  width: 252px; z-index: 4; pointer-events: none;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   color: rgba(${C}, 0.92);
   opacity: 0; transition: opacity 0.8s ease;

@@ -20,41 +20,41 @@ interface SeStats {
 
 const CSS = `
 #evo-hud {
-  position: fixed; right: 22px; top: 50%; transform: translateY(-50%);
+  position: fixed; left: 22px; top: 50%; transform: translateY(-50%);
   width: 270px; z-index: 4; pointer-events: none;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   color: rgba(${C}, 0.92);
   opacity: 0; transition: opacity 0.8s ease;
-  filter: drop-shadow(0 0 14px rgba(${GREEN}, 0.14));
+  filter: drop-shadow(0 0 14px rgba(${C}, 0.18));
 }
 #evo-hud.show { opacity: 1; }
 .evo-frame {
   position: relative;
-  background: linear-gradient(180deg, rgba(6,16,14,0.82), rgba(4,10,10,0.9));
-  border: 1px solid rgba(${GREEN}, 0.3);
+  background: linear-gradient(180deg, rgba(6,12,20,0.82), rgba(4,8,14,0.9));
+  border: 1px solid rgba(${C}, 0.35);
   border-radius: 6px; padding: 12px 13px 13px; overflow: hidden;
 }
 .evo-frame::after {
   content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
-  background: linear-gradient(90deg, transparent, rgba(${GREEN}, 0.5), transparent);
+  background: linear-gradient(90deg, transparent, rgba(${C}, 0.5), transparent);
   animation: evo-scan 4.2s linear infinite; opacity: 0.55;
 }
 @keyframes evo-scan { 0% { top: 0; } 100% { top: 100%; } }
-.evo-frame > .br { position: absolute; width: 12px; height: 12px; border: 2px solid rgba(${GREEN}, 0.65); }
+.evo-frame > .br { position: absolute; width: 12px; height: 12px; border: 2px solid rgba(${C}, 0.7); }
 .evo-frame > .br.tl { top: 4px; left: 4px; border-right: 0; border-bottom: 0; }
 .evo-frame > .br.tr { top: 4px; right: 4px; border-left: 0; border-bottom: 0; }
 .evo-frame > .br.bl { bottom: 4px; left: 4px; border-right: 0; border-top: 0; }
 .evo-frame > .br.br2 { bottom: 4px; right: 4px; border-left: 0; border-top: 0; }
 
 .evo-head { display: flex; align-items: center; gap: 7px; font-size: 10px;
-  letter-spacing: 2.2px; text-transform: uppercase; color: rgba(${GREEN}, 0.95);
-  border-bottom: 1px solid rgba(${GREEN}, 0.16); padding-bottom: 7px; }
+  letter-spacing: 2.2px; text-transform: uppercase; color: rgba(${C}, 0.95);
+  border-bottom: 1px solid rgba(${C}, 0.18); padding-bottom: 7px; }
 .evo-dot { width: 7px; height: 7px; border-radius: 50%; background: rgba(${GREEN}, 1);
   box-shadow: 0 0 8px rgba(${GREEN}, 0.9); animation: evo-blink 1.8s ease-in-out infinite; }
 .evo-dot.off { background: rgba(150,150,150,1); box-shadow: none; }
 @keyframes evo-blink { 50% { opacity: 0.35; } }
 .evo-head .grow { flex: 1; }
-.evo-head .live { font-size: 8px; letter-spacing: 1.5px; color: rgba(${GREEN}, 0.6); }
+.evo-head .live { font-size: 8px; letter-spacing: 1.5px; color: rgba(${C}, 0.6); }
 
 .evo-big { text-align: center; margin: 11px 0 9px; }
 .evo-big .n { font-size: 30px; font-weight: 700; line-height: 1; color: rgba(${GREEN}, 1);
@@ -109,7 +109,7 @@ export function createLearningHud(): LearningHud {
       <span class="br bl"></span><span class="br br2"></span>
       <div class="evo-head">
         <span class="evo-dot" id="evo-dot"></span>
-        <span>Self-Evolution</span><span class="grow"></span><span class="live">LIVE</span>
+        <span>Self-Improvements</span><span class="grow"></span><span class="live">LIVE</span>
       </div>
       <div class="evo-big">
         <div class="n" id="evo-total">0</div>
