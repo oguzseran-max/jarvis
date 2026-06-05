@@ -1989,12 +1989,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# WatchGuard access log (Phase 1: log only, never blocks). Records every HTTP
+# request from a NON-localhost client — its source IP, method and the path it
+# hit — so we have a forensic trail of *what* an unauthorised device tried.
+_WG_ACCESS_LOG = Path(__file__).resolve().parent / ".run" / "access.log"
+
+
+@app.middleware("http")
+async def _watchguard_access_log(request: Request, call_next):
+    client = request.client.host if request.client else "?"
+    response = await call_next(request)
+    try:
+        if not (client.startswith("127.") or client in ("::1", "localhost")):
+            _WG_ACCESS_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(_WG_ACCESS_LOG, "a") as f:
+                f.write(f"{datetime.now().isoformat(timespec='seconds')} {client} "
+                        f"{request.method} {request.url.path} -> {response.status_code}\n")
+    except Exception:
+        pass
+    return response
+
 
 # -- REST Endpoints --------------------------------------------------------
 
 @app.get("/api/health")
 async def health():
     return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
+
+
+@app.post("/api/watchguard/announce")
+async def api_watchguard_announce(payload: dict, request: Request):
+    """Internal alert sink — lets watchguard.py make Marion speak an alert out
+    loud. LOCAL-ONLY: rejected for any non-loopback client so it can't itself be
+    abused from the network."""
+    client = request.client.host if request.client else ""
+    if not (client.startswith("127.") or client in ("::1", "localhost")):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    text = (payload.get("text") or "").strip()
+    if text:
+        try:
+            await task_manager.push_speech(text, lang=payload.get("lang", "fr"))
+        except Exception as e:
+            log.warning(f"watchguard announce failed: {e}")
+    return {"ok": True}
 
 
 @app.get("/api/tts-test")

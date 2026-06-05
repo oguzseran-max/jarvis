@@ -36,6 +36,15 @@ else
       >"$LOG_DIR/backend.log" 2>&1 & )
 fi
 
+# WatchGuard — real-time intrusion watch (Phase 1: observe + alert, never blocks)
+if pgrep -f "watchguard.py" >/dev/null 2>&1; then
+  echo "[jarvis] watchguard already running"
+else
+  echo "[jarvis] starting watchguard"
+  ( cd "$JARVIS_DIR" && nohup ./venv/bin/python watchguard.py \
+      >"$LOG_DIR/watchguard.log" 2>&1 & )
+fi
+
 # Frontend
 if port_up "$FRONTEND_PORT"; then
   echo "[jarvis] frontend already running on :$FRONTEND_PORT"
