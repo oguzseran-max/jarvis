@@ -1250,6 +1250,82 @@ async def _recognize_and_greet(jpeg: bytes):
         log.warning(f"surveillance greet failed: {e}")
 
 
+# ── Recognise the user's car arriving at the gate (DoorBird motion → plate) ──
+OZ_PLATE = os.getenv("OZ_PLATE", "GX-137-QN")
+OZ_PLATE_NORM = "".join(ch for ch in OZ_PLATE.upper() if ch.isalnum())
+OZ_CAR_DESC = os.getenv("OZ_CAR_DESC", "Audi Q4 e-tron noire")
+GATE_AUTO_OPEN_FOR_CAR = os.getenv("GATE_AUTO_OPEN_FOR_CAR", "0") == "1"
+CAR_COOLDOWN_S = int(os.getenv("CAR_COOLDOWN_S", "300"))  # 5 min between announces
+_car_cooldown = {"t": 0.0}
+
+
+def _norm_plate(s: str) -> str:
+    return "".join(ch for ch in (s or "").upper() if ch.isalnum())
+
+
+def _lev(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+async def _read_plate(frame_b64: str) -> dict:
+    """Claude-vision: read any licence plate + car colour/make from a gate frame."""
+    if not frame_b64 or not anthropic_client:
+        return {}
+    try:
+        resp = await anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=120,
+            system=("You see a front-gate camera image. If a CAR is visible, read its licence "
+                    "plate (letters and digits only) and note its colour and make. Respond with "
+                    "STRICT JSON, no prose: {\"car_present\": true/false, \"plate\": \"<plate or "
+                    "empty>\", \"description\": \"<colour make or empty>\"}. Empty plate if none "
+                    "is readable."),
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": frame_b64}},
+                {"type": "text", "text": "Is there a car? Read its plate."},
+            ]}],
+        )
+        import json as _json
+        import re as _re
+        m = _re.search(r"\{.*\}", resp.content[0].text, _re.S)
+        return _json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        log.warning(f"plate read failed: {e}")
+        return {}
+
+
+async def _on_gate_motion():
+    """Motion at the gate → snapshot → if it's Oz's car (plate GX-137-QN), Marion
+    announces it. Optionally opens the gate (GATE_AUTO_OPEN_FOR_CAR=1)."""
+    if time.time() - _car_cooldown["t"] < CAR_COOLDOWN_S:
+        return
+    img = await doorbird.snapshot()
+    if not img:
+        return
+    info = await _read_plate(base64.b64encode(img).decode())
+    plate = _norm_plate(info.get("plate", ""))
+    if not (plate and _lev(plate, OZ_PLATE_NORM) <= 1):
+        return  # not Oz's car (or no readable plate)
+    _car_cooldown["t"] = time.time()
+    log.info(f"[gate] Oz's car recognised (plate read '{plate}')")
+    try:
+        await task_manager.push_speech("Ta voiture arrive, mon amour.", lang="fr")
+    except Exception as e:
+        log.warning(f"car announce failed: {e}")
+    if GATE_AUTO_OPEN_FOR_CAR:
+        try:
+            await doorbird.open_gate()
+            log.info("[gate] auto-opened for Oz's car")
+        except Exception as e:
+            log.warning(f"auto-open failed: {e}")
+
+
 async def _on_doorbell():
     """Someone rang the gate: snapshot → describe the visitor → Marion announces it
     to whatever frontend is connected. The user can then say 'ouvre le portail'."""
@@ -2033,6 +2109,9 @@ async def lifespan(application: FastAPI):
     if doorbird.enabled():
         asyncio.create_task(doorbird.monitor_rings(_on_doorbell))
         log.info("DoorBird ring monitor task started")
+        # Also watch the gate MOTION sensor → recognise Oz's car (plate GX-137-QN).
+        asyncio.create_task(doorbird.monitor_motion(_on_gate_motion))
+        log.info("DoorBird motion monitor task started (car recognition)")
 
     # Pre-warm the Plejd BLE connection + gateway so light commands are fast from
     # the first one (the slow ~20s connect happens here, not on the first command).

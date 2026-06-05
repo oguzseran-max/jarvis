@@ -75,6 +75,40 @@ async def video_stream():
                 yield chunk
 
 
+async def monitor_motion(on_motion, cooldown: float = 15.0):
+    """Stream the DoorBird MOTION sensor and call async `on_motion()` each time
+    motion is detected at the gate (debounced by `cooldown`). Same shape as
+    monitor_rings; used to spot the user's car arriving."""
+    if not enabled():
+        return
+    url = f"http://{HOST}/bha-api/monitor.cgi"
+    last = 0.0
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=None) as http:
+                async with http.stream("GET", url, params={"ring": "motionsensor"},
+                                       auth=httpx.DigestAuth(USER, PASS)) as resp:
+                    if resp.status_code != 200:
+                        log.warning("DoorBird motion monitor HTTP %s", resp.status_code)
+                        await asyncio.sleep(15)
+                        continue
+                    log.info("DoorBird motion monitor connected")
+                    async for line in resp.aiter_lines():
+                        s = line.strip().lower()
+                        if s.startswith("motionsensor:"):
+                            val = s.split(":", 1)[1]
+                            if val in ("h", "1", "high", "on") and time.time() - last > cooldown:
+                                last = time.time()
+                                log.info("DoorBird motion detected")
+                                try:
+                                    await on_motion()
+                                except Exception as e:
+                                    log.error("on_motion handler error: %s", e)
+        except Exception as e:
+            log.warning("DoorBird motion monitor stream error: %s", e)
+        await asyncio.sleep(8)
+
+
 async def monitor_rings(on_ring, cooldown: float = 6.0):
     """Hold a streaming connection to the DoorBird event monitor and call the
     async `on_ring()` callback each time the doorbell is pressed. Auto-reconnects;
