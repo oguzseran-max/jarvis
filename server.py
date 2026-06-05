@@ -2017,6 +2017,41 @@ async def health():
     return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
 
 
+@app.get("/api/watchguard/stats")
+async def api_watchguard_stats():
+    """Live security telemetry for the in-app diagnostic HUD: alert counts by
+    severity, the most recent events, and whether the watchguard is running."""
+    import sqlite3
+    import subprocess as _sp
+    db = Path(__file__).resolve().parent / "data" / "watchguard.db"
+    out = {"active": False, "total": 0, "critical": 0, "warning": 0,
+           "info": 0, "recent": [], "ports": [], "files": 0}
+    try:
+        r = _sp.run(["pgrep", "-f", "watchguard.py"], capture_output=True, timeout=3)
+        out["active"] = r.returncode == 0
+    except Exception:
+        pass
+    if db.exists():
+        try:
+            c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            c.row_factory = sqlite3.Row
+            for row in c.execute("SELECT severity, COUNT(*) n FROM events GROUP BY severity"):
+                sev = (row["severity"] or "info").lower()
+                out[sev] = out.get(sev, 0) + row["n"]
+                out["total"] += row["n"]
+            out["recent"] = [
+                {"ts": r2["ts"], "severity": r2["severity"], "kind": r2["kind"],
+                 "source": r2["source"], "detail": r2["detail"]}
+                for r2 in c.execute(
+                    "SELECT ts, severity, kind, source, detail FROM events "
+                    "ORDER BY id DESC LIMIT 12")
+            ]
+            c.close()
+        except Exception:
+            pass
+    return out
+
+
 @app.post("/api/watchguard/announce")
 async def api_watchguard_announce(payload: dict, request: Request):
     """Internal alert sink — lets watchguard.py make Marion speak an alert out

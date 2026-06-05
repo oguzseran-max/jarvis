@@ -12,6 +12,7 @@ import { createBuildHud } from "./build_hud";
 import { createWeather } from "./weather";
 import { createBoot } from "./boot";
 import { createCornerHud } from "./hud";
+import { createSecurityHud } from "./security_hud";
 import { createAudioPlayer } from "./voice";
 import { createAudioCapture } from "./audio_capture";
 import { createSocket } from "./ws";
@@ -69,6 +70,7 @@ const marion = createMarion("/marion-cutout.png");
 // Languages that show Marion's face rather than the orb.
 const FACE_LANGS = new Set(["fr", "tr"]);
 const cornerHud = createCornerHud(); // persistent 4-corner monitoring panels
+const securityHud = createSecurityHud(); // mid-left live WatchGuard threat panel
 const buildHud = createBuildHud(); // middle-right progress panel for background builds
 
 // Live gate camera (DoorBird) — small panel bottom-left, next to DIAGNOSTICS.
@@ -397,6 +399,7 @@ bootMusic.addEventListener("timeupdate", () => {
     // to the faint ambient level.
     orb.ignite();
     cornerHud.reveal();
+  securityHud.reveal();
     bootOverlay.classList.add("done");
     fadeMusicTo(AMBIENT_MUSIC_VOL, 2500);
   }
@@ -411,6 +414,7 @@ function endBoot() {
   fadeMusicTo(AMBIENT_MUSIC_VOL, 2500);
   if (!bootFaded) { bootFaded = true; orb.ignite(); } // ignite if we never crossfaded
   cornerHud.reveal();
+  securityHud.reveal();
   boot.fadeOut();
   bootOverlay.classList.add("done");
   setTimeout(() => { boot.dispose(); bootOverlay.style.display = "none"; }, 1500);
@@ -630,6 +634,7 @@ if (["rain", "storm", "clear", "clouds"].includes(decodeURIComponent(location.ha
   bootOverlay.style.display = "none";
   orb.ignite();
   cornerHud.reveal();
+  securityHud.reveal();
   setLanguage("fr");         // show Marion (with her weather accessory)
   // weather.start() (above) reads the hash and stages the effect.
 }
