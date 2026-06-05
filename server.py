@@ -141,6 +141,7 @@ YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT N
 - You CAN see what's on {user_name}'s screen — open windows, active apps, and screenshot vision
 - You CAN look through {user_name}'s webcam — a single on-demand photo via [ACTION:CAMERA]. Use it when he asks you to look at him or use the camera. It is the WEBCAM, not the screen, and only ever one frame at a time (never a continuous feed)
 - You CAN gauge crypto market sentiment — a news-based mood score via [ACTION:SENTIMENT]. Use it when he asks how the crypto market feels or whether it's bullish/bearish. It reads news headlines only; never present it as trading advice or a price prediction
+- You CAN play music on the house speakers via Spotify — any artist, song, album or playlist, plus pause/skip — with [ACTION:MUSIC]. Whenever {user_name} names an artist or song with intent to HEAR it, PLAY it; do NOT just describe the artist. Speech-to-text frequently mangles the play verb ("mets"/"joue"), so "Medoua Lipa", "et Dua Lipa", "Dua Lipa" all mean "mets Dua Lipa" → play her. If he just names music, assume he wants it played
 - You ARE genuinely current on the news. Recent headlines (world/geopolitics, AI, technology, plus Geneva and Istanbul) are continuously refreshed into your WORLD NEWS context below. Answer news questions DIRECTLY and instantly from them — never "as of my knowledge cutoff", never a stalling "let me check". Use [ACTION:NEWS] ONLY for a deeper dive on something not in those headlines.
 - You CAN read {user_name}'s calendar — today's events, upcoming meetings, schedule overview
 - You CAN read {user_name}'s email (READ-ONLY) — unread count, recent messages, search by sender/subject. You CANNOT send, delete, or modify emails.
@@ -223,6 +224,7 @@ When you decide the user needs something DONE (not just discussed), include an a
 - [ACTION:CAMERA] — take a single webcam photo and give your read on the user: their OUTFIT/look and their STATE (on form, tired, stressed…), with your usual wit and the occasional sarcastic jab. Use whenever they mean the camera/webcam or themselves: "look at me", "how do I look", "what do you think of my outfit", "do I look tired", "use the camera". This is the WEBCAM, distinct from SCREEN (the desktop). On-demand single frame only; never continuous.
 - [ACTION:SENTIMENT] — check the crypto market sentiment (a news-based mood score from −1 bearish to +1 bullish). Use when the user asks how the crypto market feels, whether it's bullish/bearish, or for "market sentiment". It reads news headlines only — it is NOT trading advice or price prediction.
 - [ACTION:NEWS] — ONLY for a DEEPER news dive on something your WORLD NEWS context doesn't already cover. Normal news/geopolitics/AI/tech/Geneva/Istanbul questions you answer INSTANTLY from context (no tag, no "let me check"). When you do use it, put the question after the tag, e.g. "[ACTION:NEWS] latest on the situation in the Middle East".
+- [ACTION:MUSIC] query — play music on the Spotify speakers. Put the artist / song / album / playlist after the tag, or `pause` / `next` / `resume`. Examples: "mets Dua Lipa" → "[ACTION:MUSIC] Dua Lipa" ; "joue du Stromae" → "[ACTION:MUSIC] Stromae" ; "chanson suivante" → "[ACTION:MUSIC] next" ; "mets pause" → "[ACTION:MUSIC] pause". The transcription often garbles the verb ("Medoua Lipa", "et Dua Lipa") — recover the artist/song name and emit the tag anyway. ALWAYS give a SHORT spoken confirmation BEFORE the tag (e.g. "Tout de suite, mon amour. [ACTION:MUSIC] Dua Lipa"). NEVER describe the artist instead of playing — naming music means he wants to hear it.
 - [ACTION:WEATHER] place — precise live weather for ANY city, region or country worldwide. Use whenever the user asks the weather somewhere OTHER than home: "what's the weather in Tokyo", "quel temps fait-il à Paris", "is it raining in London". Put ONLY the place name after the tag, e.g. "[ACTION:WEATHER] Tokyo". Give a short spoken lead-in BEFORE the tag (e.g. "One moment, sir. [ACTION:WEATHER] Tokyo") — the precise figures are spoken automatically once fetched, so do NOT invent temperatures yourself. For the LOCAL/home weather you already have, answer inline without this tag.
 - [ACTION:BUILD] description — when user wants a project built. Claude Code does the work.
 - [ACTION:BROWSE] url or search query — when user wants to see a webpage or search result in Chrome
@@ -1089,7 +1091,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CAMERA|SENTIMENT|NEWS|WEATHER|LIGHTS|GATE)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CAMERA|SENTIMENT|NEWS|WEATHER|MUSIC|LIGHTS|GATE)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -1180,6 +1182,49 @@ async def _execute_gate(voice_state: dict, ws):
         pass
 
 
+async def _execute_music(target: str, voice_state: dict, ws):
+    """Play/pause/skip on Spotify from an [ACTION:MUSIC] tag.
+
+    This is the robust fallback for when the fast keyword path
+    (`spotify_access.parse_command`) misses — speech-to-text often mangles the
+    play verb ("mets Dua Lipa" → "Medoua Lipa" / "et Dua Lipa"), which the LLM
+    understands but a keyword match can't. The LLM's spoken reply is the
+    confirmation; we only speak here if something goes wrong."""
+    lang = (voice_state or {}).get("lang", "en")
+    t = (target or "").strip()
+    low = t.lower()
+
+    if not spotify_access.is_configured():
+        msg = {"fr": "Spotify n'est pas connecté, mon amour.",
+               "tr": "Spotify bağlı değil canım."}.get(lang, "Spotify isn't connected, sir.")
+    else:
+        res = None
+        try:
+            if low in ("pause", "stop", "arrête", "arrete", "stoppe", "duraklat"):
+                res = await spotify_access.pause()
+            elif low in ("next", "skip", "suivant", "suivante", "passe", "sonraki"):
+                res = await spotify_access.next_track()
+            elif low in ("", "resume", "reprends", "continue", "play", "devam"):
+                res = await spotify_access.play(None)
+            else:
+                res = await spotify_access.play(t)
+        except Exception as e:
+            log.warning(f"[music] command failed: {e}")
+        log.info(f"[music] target={t!r} -> ok={getattr(res, 'ok', None)} detail={getattr(res, 'detail', None)}")
+        if res and res.ok:
+            return
+        msg = {"fr": "Je n'arrive pas à lancer ça sur Spotify, mon amour.",
+               "tr": "Bunu Spotify'da başlatamadım canım."}.get(
+                   lang, "I couldn't start that on Spotify, sir.")
+    try:
+        audio = await synthesize_speech(msg, lang=lang)
+        if audio and ws:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await _speak_briefing(ws, voice_state, lang, audio, msg)
+    except Exception:
+        pass
+
+
 _VISITOR_LANG = {"fr": ("French", "mon amour"), "tr": ("Turkish", "canım")}
 
 
@@ -1257,6 +1302,16 @@ OZ_CAR_DESC = os.getenv("OZ_CAR_DESC", "Audi Q4 e-tron noire")
 GATE_AUTO_OPEN_FOR_CAR = os.getenv("GATE_AUTO_OPEN_FOR_CAR", "0") == "1"
 CAR_COOLDOWN_S = int(os.getenv("CAR_COOLDOWN_S", "300"))  # 5 min between announces
 _car_cooldown = {"t": 0.0}
+
+# Owner presence (iPhone geofence webhook) — REQUIRED 2nd factor for auto-open:
+# the gate opens only if the plate matches AND the owner's phone is near home.
+PRESENCE_TOKEN = os.getenv("PRESENCE_TOKEN", "")
+PRESENCE_TTL_S = int(os.getenv("PRESENCE_TTL_S", "600"))  # "near" stays valid 10 min
+_owner_presence = {"near": False, "ts": 0.0}
+
+
+def _owner_is_near() -> bool:
+    return _owner_presence["near"] and (time.time() - _owner_presence["ts"] < PRESENCE_TTL_S)
 
 
 def _norm_plate(s: str) -> str:
@@ -1371,16 +1426,19 @@ async def _on_gate_motion():
         await task_manager.push_speech("Ta voiture arrive, mon amour.", lang="fr")
     except Exception as e:
         log.warning(f"car announce failed: {e}")
-    # Auto-open only on an EXACT plate match (the announce above tolerates one
-    # OCR slip, but opening a physical gate must not act on a fuzzy read).
+    # Auto-open requires BOTH the EXACT plate AND the owner's phone near home
+    # (2nd factor). A copycat plate alone never opens the gate; and the plate
+    # itself (not a fuzzy read) must match to act on a physical gate.
     if GATE_AUTO_OPEN_FOR_CAR and plate == OZ_PLATE_NORM:
-        try:
-            await doorbird.open_gate()
-            log.info("[gate] auto-opened for Oz's car (exact plate match)")
-            # Close it again once the car has driven through.
-            asyncio.create_task(_close_gate_after_pass())
-        except Exception as e:
-            log.warning(f"auto-open failed: {e}")
+        if _owner_is_near():
+            try:
+                await doorbird.open_gate()
+                log.info("[gate] auto-opened (exact plate + owner present)")
+                asyncio.create_task(_close_gate_after_pass())  # close once through
+            except Exception as e:
+                log.warning(f"auto-open failed: {e}")
+        else:
+            log.info("[gate] plate matched but owner NOT near -> NOT opening (2nd factor)")
 
 
 async def _on_doorbell():
@@ -2215,6 +2273,22 @@ async def _watchguard_access_log(request: Request, call_next):
 @app.get("/api/health")
 async def health():
     return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
+
+
+@app.api_route("/api/presence", methods=["GET", "POST"])
+async def api_presence(request: Request):
+    """Owner geofence webhook (called by an iPhone Shortcut on arriving/leaving
+    home). Token-protected. ?state=home|arriving marks the owner near (the gate's
+    2nd factor); ?state=away clears it. GET so a Shortcut can just open a URL."""
+    token = request.query_params.get("token", "")
+    if not PRESENCE_TOKEN or token != PRESENCE_TOKEN:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    state = (request.query_params.get("state") or "home").lower()
+    near = state in ("home", "arriving", "arrive", "near", "1", "true", "yes")
+    _owner_presence["near"] = near
+    _owner_presence["ts"] = time.time()
+    log.info(f"[presence] owner state={state} near={near}")
+    return {"ok": True, "near": near, "ttl_s": PRESENCE_TTL_S}
 
 
 @app.get("/api/selfeval/stats")
@@ -4038,6 +4112,9 @@ async def voice_handler(ws: WebSocket):
                                     asyncio.create_task(_execute_lights(embedded_action["target"], voice_state, ws))
                                 elif embedded_action["action"] == "gate":
                                     asyncio.create_task(_execute_gate(voice_state, ws))
+                                elif embedded_action["action"] == "music":
+                                    # Marion's spoken reply confirms; playback runs in background.
+                                    asyncio.create_task(_execute_music(embedded_action["target"], voice_state, ws))
                                 elif embedded_action["action"] == "news":
                                     _nlang = voice_state.get("lang", "en")
                                     _nq = embedded_action["target"].strip() or user_text
