@@ -408,3 +408,67 @@ def format_portfolio_summary(portfolio: Portfolio) -> str:
     named = ", ".join(symbols)
     tail = ", among others" if len(portfolio.holdings) > 3 else ""
     return f"You're holding {holdings_phrase}, sir — {named}{tail}."
+
+
+# ---------------------------------------------------------------------------
+# Local diagnostic CLI — `python -m revolut_access`
+# ---------------------------------------------------------------------------
+#
+# Run on the machine that holds your .env / keys to verify the integration
+# end-to-end against the live API. Strictly read-only: it only reads balances,
+# prices, and your stocks file — it never trades or moves money.
+
+async def _diagnose() -> int:
+    """Print a configuration report and the live portfolio. Returns exit code."""
+    print("JARVIS · Revolut investments — local check (read-only)\n")
+
+    # --- Configuration report ---
+    print("Configuration:")
+    crypto_ready = is_crypto_configured()
+    if crypto_ready:
+        print(f"  crypto   : configured (key + {REVX_PRIVATE_KEY_PATH})")
+    else:
+        why = []
+        if not REVX_API_KEY:
+            why.append("REVOLUT_X_API_KEY not set")
+        if not REVX_PRIVATE_KEY_PATH:
+            why.append("REVOLUT_X_PRIVATE_KEY not set")
+        elif not Path(REVX_PRIVATE_KEY_PATH).is_file():
+            why.append(f"private key not found at {REVX_PRIVATE_KEY_PATH}")
+        print(f"  crypto   : not configured ({'; '.join(why) or 'incomplete'})")
+
+    stocks_path = Path(STOCKS_FILE)
+    print(f"  stocks   : {'found ' + str(stocks_path) if stocks_path.is_file() else 'no file at ' + str(stocks_path)}")
+    print(f"  base url : {REVX_BASE_URL}")
+    print(f"  value in : {VALUE_CURRENCY}\n")
+
+    # --- Live fetch ---
+    print("Fetching portfolio…\n")
+    portfolio = await get_portfolio()
+
+    if portfolio.errors:
+        print("Problems encountered:")
+        for err in portfolio.errors:
+            print(f"  ! {err}")
+        print()
+
+    if not portfolio.holdings:
+        print("No holdings returned.")
+        if not crypto_ready and not stocks_path.is_file():
+            print("Nothing is configured yet — add crypto keys and/or a stocks file (see .env.example).")
+            return 2
+        return 1 if portfolio.errors else 0
+
+    print(format_portfolio_for_context(portfolio))
+    print()
+    print("Voice summary:")
+    print(f"  {format_portfolio_summary(portfolio)}")
+    return 1 if portfolio.errors else 0
+
+
+if __name__ == "__main__":
+    import asyncio as _asyncio
+    import sys as _sys
+
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    _sys.exit(_asyncio.run(_diagnose()))

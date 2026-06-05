@@ -273,6 +273,14 @@ async def test_get_crypto_holdings_values_in_fiat(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_diagnose_unconfigured_returns_2(monkeypatch, tmp_path):
+    monkeypatch.setattr(ra, "REVX_API_KEY", "")
+    monkeypatch.setattr(ra, "REVX_PRIVATE_KEY_PATH", "")
+    monkeypatch.setattr(ra, "STOCKS_FILE", str(tmp_path / "none.json"))
+    assert await ra._diagnose() == 2
+
+
+@pytest.mark.asyncio
 async def test_get_crypto_holdings_unpriced_leaves_value_none(monkeypatch):
     balances = [{"currency": "XYZ", "available": "10", "staked": "0", "reserved": "0"}]
     monkeypatch.setattr(ra, "is_crypto_configured", lambda: True)
