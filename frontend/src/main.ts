@@ -618,6 +618,14 @@ btnAvatar?.addEventListener("click", (e) => {
   e.stopPropagation();
   window.open(`${location.protocol}//${location.hostname}:5174`, "_blank");
 });
+
+// Network button — opens the LAN surveillance dashboard (network.html, served
+// same-origin) in a new tab, without leaving the orb.
+const btnNetwork = document.getElementById("btn-network");
+btnNetwork?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  window.open("/network.html", "_blank");
+});
 const menuDropdown = document.getElementById("menu-dropdown")!;
 const btnRestart = document.getElementById("btn-restart")!;
 const btnFixSelf = document.getElementById("btn-fix-self")!;
