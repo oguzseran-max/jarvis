@@ -44,6 +44,7 @@ from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
 from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
 from mail_access import get_unread_count, get_unread_messages, get_recent_messages, search_mail, read_message, format_unread_summary, format_messages_for_context, format_messages_for_voice
+from revolut_access import get_portfolio, format_portfolio_for_context, format_portfolio_summary
 from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
     create_note, search_notes, get_tasks_for_date, build_memory_context,
@@ -1200,6 +1201,11 @@ async def generate_response(
     if lookup_status:
         system += f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
 
+    # Inject Revolut investments context (read-only) when available
+    investments_ctx = _ctx_cache.get("investments")
+    if investments_ctx:
+        system += f"\n\nREVOLUT INVESTMENTS (read-only — never trade or move money):\n{investments_ctx}"
+
     # Inject relevant memories and tasks
     memory_ctx = build_memory_context(text)
     if memory_ctx:
@@ -1335,6 +1341,7 @@ _ctx_cache = {
     "calendar": "No calendar data yet.",
     "mail": "No mail data yet.",
     "weather": "Weather data unavailable.",
+    "investments": "",
 }
 
 
@@ -1571,6 +1578,13 @@ def detect_action_fast(text: str) -> dict | None:
                              "any emails", "any mail", "email update", "mail update"]):
         return {"action": "check_mail"}
 
+    # Investments — explicit Revolut/portfolio requests (read-only)
+    if any(p in t for p in ["my investments", "check my investments", "my portfolio",
+                             "check my portfolio", "how are my investments", "my revolut",
+                             "revolut investments", "my crypto", "my stocks", "my holdings",
+                             "how's my portfolio", "hows my portfolio", "portfolio update"]):
+        return {"action": "check_investments"}
+
     # Dispatch / build status check
     if any(p in t for p in ["where are we", "where were we", "project status", "how's the build",
                              "hows the build", "status update", "status report", "where is that",
@@ -1758,6 +1772,13 @@ async def _do_mail_lookup() -> str:
             return f"{summary} Most recent: {details}."
         return summary
     return "Couldn't reach Mail at the moment, sir."
+
+
+async def _do_investments_lookup() -> str:
+    """Fetch Revolut portfolio (read-only) and cache context for the LLM."""
+    portfolio = await get_portfolio()
+    _ctx_cache["investments"] = format_portfolio_for_context(portfolio)
+    return format_portfolio_summary(portfolio)
 
 
 async def _do_screen_lookup() -> str:
@@ -2200,6 +2221,9 @@ async def voice_handler(ws: WebSocket):
                         elif action["action"] == "check_mail":
                             response_text = "Checking your inbox now, sir."
                             asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
+                        elif action["action"] == "check_investments":
+                            response_text = "Pulling up your Revolut investments now, sir."
+                            asyncio.create_task(_lookup_and_report("investments", _do_investments_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_dispatch":
                             recent = dispatch_registry.get_most_recent()
                             if not recent:

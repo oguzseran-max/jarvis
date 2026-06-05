@@ -1,0 +1,5 @@
+[
+  { "symbol": "AAPL", "quantity": 10, "value": 1850.00, "currency": "USD" },
+  { "symbol": "VWRP", "quantity": 25, "value": 3120.50, "currency": "GBP" },
+  { "symbol": "TSLA", "quantity": 4,  "value": 980.00,  "currency": "USD" }
+]

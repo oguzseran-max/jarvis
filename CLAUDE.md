@@ -32,6 +32,7 @@ When a user clones this repo and starts Claude Code, help them:
 - `memory.py` — SQLite memory system with FTS5 search
 - `calendar_access.py` — Apple Calendar integration via AppleScript
 - `mail_access.py` — Apple Mail integration (READ-ONLY)
+- `revolut_access.py` — Revolut investments (READ-ONLY): crypto via Revolut X API, stocks via local file
 - `notes_access.py` — Apple Notes integration
 - `actions.py` — System actions (Terminal, Chrome, Claude Code)
 - `browser.py` — Playwright web automation
@@ -43,6 +44,9 @@ When a user clones this repo and starts Claude Code, help them:
 - `FISH_VOICE_ID` (optional) — Voice model ID
 - `USER_NAME` (optional) — Your name for JARVIS to use
 - `CALENDAR_ACCOUNTS` (optional) — Comma-separated calendar emails
+- `REVOLUT_X_API_KEY` (optional) — Revolut X API key for crypto holdings
+- `REVOLUT_X_PRIVATE_KEY` (optional) — Path to Ed25519 PEM private key for Revolut X
+- `REVOLUT_STOCKS_FILE` (optional) — Path to JSON file of stock/ETF holdings
 
 ## Conventions
 - JARVIS personality: British butler, dry wit, economy of language
