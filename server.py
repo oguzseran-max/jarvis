@@ -1300,6 +1300,55 @@ async def _read_plate(frame_b64: str) -> dict:
         return {}
 
 
+async def _car_at_gate(img: bytes) -> bool:
+    """Quick yes/no via Claude vision: is a car right in front of / passing the gate?"""
+    if not img or not anthropic_client:
+        return False
+    try:
+        resp = await anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=6,
+            system=("You see a front-gate camera image. Answer with ONE word: YES if a car is "
+                    "right in front of or passing through the gate (close up), else NO."),
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                             "data": base64.b64encode(img).decode()}},
+                {"type": "text", "text": "Car at the gate now?"},
+            ]}],
+        )
+        return resp.content[0].text.strip().upper().startswith("Y")
+    except Exception:
+        return False
+
+
+async def _close_gate_after_pass():
+    """After auto-opening, close the gate (toggle relay 1) once the car has driven
+    through — i.e. it was seen AT the gate and then is no longer there. Polls
+    snapshots; safety-closes after a max window so the gate never stays open."""
+    seen = False
+    start = time.time()
+    while time.time() - start < 120:
+        await asyncio.sleep(6)
+        img = await doorbird.snapshot()
+        if not img:
+            continue
+        if await _car_at_gate(img):
+            seen = True            # car has arrived at the gate
+        elif seen:
+            try:
+                await doorbird.open_gate()   # relay 1 toggle = close
+                log.info("[gate] car passed through -> closing")
+            except Exception as e:
+                log.warning(f"gate close failed: {e}")
+            return
+    if seen:
+        try:
+            await doorbird.open_gate()
+            log.info("[gate] closing on safety timeout")
+        except Exception:
+            pass
+
+
 async def _on_gate_motion():
     """Motion at the gate → snapshot → if it's Oz's car (plate GX-137-QN), Marion
     announces it. Optionally opens the gate (GATE_AUTO_OPEN_FOR_CAR=1)."""
@@ -1324,6 +1373,8 @@ async def _on_gate_motion():
         try:
             await doorbird.open_gate()
             log.info("[gate] auto-opened for Oz's car (exact plate match)")
+            # Close it again once the car has driven through.
+            asyncio.create_task(_close_gate_after_pass())
         except Exception as e:
             log.warning(f"auto-open failed: {e}")
 
