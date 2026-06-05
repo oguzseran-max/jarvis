@@ -23,6 +23,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -307,6 +308,29 @@ def format_now_playing(now: NowPlaying | None) -> str:
 # Auth helper + diagnostic CLI — `python -m spotify_access [--auth]`
 # ---------------------------------------------------------------------------
 
+def _save_refresh_token(token: str) -> str | None:
+    """Write/update SPOTIFY_REFRESH_TOKEN in the repo-root .env. Returns path or None."""
+    env_path = Path(__file__).parent / ".env"
+    new_line = f"SPOTIFY_REFRESH_TOKEN={token}"
+    try:
+        if env_path.exists():
+            lines = env_path.read_text().splitlines()
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("SPOTIFY_REFRESH_TOKEN=") and not stripped.startswith("#"):
+                    lines[i] = new_line
+                    break
+            else:
+                lines.append(new_line)
+            env_path.write_text("\n".join(lines) + "\n")
+        else:
+            env_path.write_text(new_line + "\n")
+        return str(env_path)
+    except Exception as e:
+        log.warning(f"Could not write .env automatically: {e}")
+        return None
+
+
 def _run_auth_flow() -> int:
     """One-time Authorization Code flow to capture a refresh token."""
     import urllib.parse
@@ -368,8 +392,13 @@ def _run_auth_flow() -> int:
         print("No refresh token returned.")
         return 1
 
-    print("\n✅ Success. Add this to your .env:\n")
-    print(f"SPOTIFY_REFRESH_TOKEN={refresh}\n")
+    saved = _save_refresh_token(refresh)
+    if saved:
+        print(f"\n✅ Success — saved SPOTIFY_REFRESH_TOKEN to {saved}")
+        print("You're all set. Verify with:  python -m spotify_access")
+    else:
+        print("\n✅ Success. Add this line to your .env manually:\n")
+        print(f"SPOTIFY_REFRESH_TOKEN={refresh}\n")
     return 0
 
 

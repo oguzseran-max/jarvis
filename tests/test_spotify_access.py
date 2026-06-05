@@ -213,6 +213,36 @@ def test_format_now_playing():
     assert format_now_playing(NowPlaying("Get Lucky", "Daft Punk", False)).startswith("Paused on")
 
 
+# --- .env writer -----------------------------------------------------------
+
+def test_save_refresh_token_appends_when_absent(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("SPOTIFY_CLIENT_ID=abc\n")
+    monkeypatch.setattr(sp, "__file__", str(tmp_path / "spotify_access.py"))
+    path = sp._save_refresh_token("REFRESH123")
+    assert path is not None
+    text = env.read_text()
+    assert "SPOTIFY_CLIENT_ID=abc" in text
+    assert "SPOTIFY_REFRESH_TOKEN=REFRESH123" in text
+
+
+def test_save_refresh_token_updates_existing(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("SPOTIFY_REFRESH_TOKEN=OLD\nSPOTIFY_DEVICE_NAME=Marshall\n")
+    monkeypatch.setattr(sp, "__file__", str(tmp_path / "spotify_access.py"))
+    sp._save_refresh_token("NEW")
+    text = env.read_text()
+    assert "SPOTIFY_REFRESH_TOKEN=NEW" in text
+    assert "OLD" not in text
+    assert "SPOTIFY_DEVICE_NAME=Marshall" in text  # other lines preserved
+
+
+def test_save_refresh_token_creates_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(sp, "__file__", str(tmp_path / "spotify_access.py"))
+    sp._save_refresh_token("TOK")
+    assert (tmp_path / ".env").read_text().strip() == "SPOTIFY_REFRESH_TOKEN=TOK"
+
+
 # --- helper ----------------------------------------------------------------
 
 async def _async(value):
