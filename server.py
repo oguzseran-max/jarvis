@@ -44,6 +44,7 @@ from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
 from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
 from mail_access import get_unread_count, get_unread_messages, get_recent_messages, search_mail, read_message, format_unread_summary, format_messages_for_context, format_messages_for_voice
+import spotify_access
 from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
     create_note, search_notes, get_tasks_for_date, build_memory_context,
@@ -204,6 +205,11 @@ CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're
 - [ACTION:CREATE_NOTE] title ||| body — create a new Apple Note. For saving plans, ideas, lists.
   "save that as a note" → [ACTION:CREATE_NOTE] Day Plan March 19 ||| Morning: client calls. Afternoon: TikTok dashboard. Evening: JARVIS improvements.
 - [ACTION:READ_NOTE] title search — read an existing Apple Note by title keyword.
+- [ACTION:PLAY_MUSIC] query — play music on Spotify (lands on the user's speakers). Query can be a song, artist, album, or playlist; leave it empty to just resume.
+  "put on some Daft Punk" → [ACTION:PLAY_MUSIC] Daft Punk
+- [ACTION:PAUSE_MUSIC] — pause Spotify playback.
+- [ACTION:NEXT_TRACK] — skip to the next track.
+- [ACTION:MUSIC_STATUS] — say what's currently playing.
 
 You use Claude Code as your tool to build, research, and write code — but YOU are the one doing the work. Never say "Claude Code did X" or "Claude Code is asking" — say "I built X", "I'm checking on that", "I found X". You ARE the intelligence. Claude Code is just your hands.
 
@@ -814,7 +820,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|PLAY_MUSIC|PAUSE_MUSIC|NEXT_TRACK|MUSIC_STATUS)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -1523,6 +1529,30 @@ def _scan_projects_sync() -> list[dict]:
     return projects
 
 
+# ---------------------------------------------------------------------------
+# Music control (Spotify → Marshall) — voice playback handlers
+# ---------------------------------------------------------------------------
+
+async def handle_play_music(query: str = "") -> str:
+    """Start/resume Spotify playback on the configured device (the Marshall)."""
+    result = await spotify_access.play(query.strip() or None)
+    return spotify_access.format_play(result)
+
+
+async def handle_pause_music() -> str:
+    result = await spotify_access.pause()
+    return "Paused, sir." if result.ok else "I couldn't pause, sir."
+
+
+async def handle_next_track() -> str:
+    result = await spotify_access.next_track()
+    return "Next track, sir." if result.ok else "I couldn't skip, sir."
+
+
+async def handle_music_status() -> str:
+    return spotify_access.format_now_playing(await spotify_access.current_track())
+
+
 def detect_action_fast(text: str) -> dict | None:
     """Keyword-based action detection — ONLY for short, obvious commands.
 
@@ -1570,6 +1600,30 @@ def detect_action_fast(text: str) -> dict | None:
                              "whats in my inbox", "read my email", "read my mail",
                              "any emails", "any mail", "email update", "mail update"]):
         return {"action": "check_mail"}
+
+    # Music — pause / skip / now-playing (checked before "play" so they win)
+    if any(p in t for p in ["pause the music", "pause music", "pause la musique", "mets pause",
+                            "stop the music", "stop music", "arrête la musique", "arrete la musique"]):
+        return {"action": "pause_music"}
+    if any(p in t for p in ["next track", "next song", "skip this", "skip the song",
+                            "morceau suivant", "chanson suivante", "passe la chanson", "musique suivante"]):
+        return {"action": "next_track"}
+    if any(p in t for p in ["what's playing", "whats playing", "what song is this", "what is this song",
+                            "c'est quoi ce morceau", "c'est quoi cette chanson", "quelle chanson",
+                            "qu'est-ce qui joue", "quel morceau"]):
+        return {"action": "music_status"}
+    # Music — "play some music" with no specific target (resume / general).
+    if any(p in t for p in ["play some music", "put on some music", "mets de la musique",
+                            "mets un peu de musique", "lance la musique", "play music",
+                            "de la musique", "some music"]):
+        return {"action": "play_music", "query": ""}
+    # Music — play a specific song/artist/playlist. Capture the query after the verb.
+    for prefix in ["play ", "put on ", "mets ", "joue ", "lance "]:
+        if t.startswith(prefix):
+            query = text.strip()[len(prefix):].strip()
+            # Avoid hijacking non-music phrasing like "play it again" with no target
+            if query and not query.lower().startswith(("it ", "that ", "it", "that")):
+                return {"action": "play_music", "query": query}
 
     # Dispatch / build status check
     if any(p in t for p in ["where are we", "where were we", "project status", "how's the build",
@@ -2200,6 +2254,14 @@ async def voice_handler(ws: WebSocket):
                         elif action["action"] == "check_mail":
                             response_text = "Checking your inbox now, sir."
                             asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
+                        elif action["action"] == "play_music":
+                            response_text = await handle_play_music(action.get("query", ""))
+                        elif action["action"] == "pause_music":
+                            response_text = await handle_pause_music()
+                        elif action["action"] == "next_track":
+                            response_text = await handle_next_track()
+                        elif action["action"] == "music_status":
+                            response_text = await handle_music_status()
                         elif action["action"] == "check_dispatch":
                             recent = dispatch_registry.get_most_recent()
                             if not recent:
@@ -2365,6 +2427,14 @@ async def voice_handler(ws: WebSocket):
                                             except Exception:
                                                 pass
                                     asyncio.create_task(_read_and_report(embedded_action["target"].strip(), ws))
+                                elif embedded_action["action"] == "play_music":
+                                    response_text = await handle_play_music(embedded_action["target"])
+                                elif embedded_action["action"] == "pause_music":
+                                    response_text = await handle_pause_music()
+                                elif embedded_action["action"] == "next_track":
+                                    response_text = await handle_next_track()
+                                elif embedded_action["action"] == "music_status":
+                                    response_text = await handle_music_status()
 
                 # Update history
                 history.append({"role": "user", "content": user_text})

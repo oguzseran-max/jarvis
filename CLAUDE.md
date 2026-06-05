@@ -32,6 +32,7 @@ When a user clones this repo and starts Claude Code, help them:
 - `memory.py` — SQLite memory system with FTS5 search
 - `calendar_access.py` — Apple Calendar integration via AppleScript
 - `mail_access.py` — Apple Mail integration (READ-ONLY)
+- `spotify_access.py` — Spotify voice playback control (targets a Connect device, e.g. Marshall)
 - `notes_access.py` — Apple Notes integration
 - `actions.py` — System actions (Terminal, Chrome, Claude Code)
 - `browser.py` — Playwright web automation
@@ -43,6 +44,9 @@ When a user clones this repo and starts Claude Code, help them:
 - `FISH_VOICE_ID` (optional) — Voice model ID
 - `USER_NAME` (optional) — Your name for JARVIS to use
 - `CALENDAR_ACCOUNTS` (optional) — Comma-separated calendar emails
+- `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` (optional) — Spotify app credentials
+- `SPOTIFY_REFRESH_TOKEN` (optional) — from `python -m spotify_access --auth`
+- `SPOTIFY_DEVICE_NAME` (optional) — Connect device to play on (e.g. the Marshall)
 
 ## Conventions
 - JARVIS personality: British butler, dry wit, economy of language
