@@ -149,7 +149,7 @@ async def test_search_defaults_to_track(monkeypatch):
     }
     _install(monkeypatch, [("GET", "/search", _FakeResp(payload))])
     mode, uri, label = await sp._search("tok", "get lucky")
-    assert mode == "uris" and uri == "spotify:track:gl" and label == "Get Lucky by Daft Punk"
+    assert mode == "uris" and uri == "spotify:track:gl" and label == "Get Lucky de Daft Punk"
 
 
 # --- Playback control ------------------------------------------------------
@@ -167,7 +167,7 @@ async def test_play_targets_device_and_track(monkeypatch):
         ("PUT", "/me/player/play", _FakeResp(status_code=204)),
     ])
     result = await sp.play("get lucky")
-    assert result.ok and result.detail == "Get Lucky by Daft Punk"
+    assert result.ok and result.detail == "Get Lucky de Daft Punk"
 
 
 @pytest.mark.asyncio
@@ -178,6 +178,7 @@ async def test_play_device_not_found(monkeypatch):
     _install(monkeypatch, [("GET", "/me/player/devices", _FakeResp(devices))])
     result = await sp.play("anything")
     assert result.ok is False and "Marshall" in result.detail and "Kitchen" in result.detail
+    assert format_play(result).startswith("Je n'ai pas pu lancer la lecture, mon amour")
 
 
 @pytest.mark.asyncio
@@ -203,15 +204,15 @@ async def test_current_track(monkeypatch):
 # --- Formatting ------------------------------------------------------------
 
 def test_format_play_success_and_failure():
-    assert format_play(PlaybackResult(True, "Get Lucky by Daft Punk")) == "Playing Get Lucky by Daft Punk, sir."
-    assert format_play(PlaybackResult(True, "resumed")) == "Resuming, sir."
-    assert "couldn't" in format_play(PlaybackResult(False, "playback failed (404)")).lower()
+    assert format_play(PlaybackResult(True, "Get Lucky de Daft Punk")) == "Je lance Get Lucky de Daft Punk, mon amour."
+    assert format_play(PlaybackResult(True, "resumed")) == "Je reprends, mon amour."
+    assert "mon amour" in format_play(PlaybackResult(False, "la lecture a échoué (404)"))
 
 
 def test_format_now_playing():
-    assert format_now_playing(None) == "Nothing is playing at the moment, sir."
-    assert format_now_playing(NowPlaying("Get Lucky", "Daft Punk", True)) == "Currently playing Get Lucky by Daft Punk, sir."
-    assert format_now_playing(NowPlaying("Get Lucky", "Daft Punk", False)).startswith("Paused on")
+    assert format_now_playing(None) == "Rien ne joue pour le moment, mon amour."
+    assert format_now_playing(NowPlaying("Get Lucky", "Daft Punk", True)) == "En lecture : Get Lucky de Daft Punk, mon amour."
+    assert format_now_playing(NowPlaying("Get Lucky", "Daft Punk", False)).startswith("En pause sur")
 
 
 # --- .env loader -----------------------------------------------------------

@@ -1541,12 +1541,12 @@ async def handle_play_music(query: str = "") -> str:
 
 async def handle_pause_music() -> str:
     result = await spotify_access.pause()
-    return "Paused, sir." if result.ok else "I couldn't pause, sir."
+    return "En pause, mon amour." if result.ok else "Je n'ai pas pu mettre en pause, mon amour."
 
 
 async def handle_next_track() -> str:
     result = await spotify_access.next_track()
-    return "Next track, sir." if result.ok else "I couldn't skip, sir."
+    return "Morceau suivant, mon amour." if result.ok else "Je n'ai pas pu passer au suivant, mon amour."
 
 
 async def handle_music_status() -> str:

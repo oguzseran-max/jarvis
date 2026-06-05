@@ -224,7 +224,7 @@ async def _search(token: str, query: str) -> tuple[str, str, str] | None:
     t = first(tracks)
     if t:
         artist = t["artists"][0]["name"] if t.get("artists") else ""
-        label = f"{t['name']} by {artist}" if artist else t["name"]
+        label = f"{t['name']} de {artist}" if artist else t["name"]
         return "uris", t["uri"], label
 
     # Last resort: any context result.
@@ -247,34 +247,34 @@ async def play(query: str | None = None, device_name: str | None = None) -> Play
     """
     token = await get_access_token()
     if not token:
-        return PlaybackResult(False, "Spotify isn't connected")
+        return PlaybackResult(False, "Spotify n'est pas connecté")
 
     device_id, names = await _resolve_device(token, device_name)
     if not device_id:
-        target = device_name or DEVICE_NAME or "a device"
-        avail = ", ".join(n for n in names if n) or "none"
-        return PlaybackResult(False, f"couldn't find {target} (available: {avail})")
+        target = device_name or DEVICE_NAME or "l'enceinte"
+        avail = ", ".join(n for n in names if n) or "aucun"
+        return PlaybackResult(False, f"je ne trouve pas {target} (disponibles : {avail})")
 
     body: dict = {}
     label = ""
     if query:
         found = await _search(token, query)
         if not found:
-            return PlaybackResult(False, f"couldn't find anything for '{query}'")
+            return PlaybackResult(False, f"aucun résultat pour « {query} »")
         mode, uri, label = found
         body = {mode: [uri]} if mode == "uris" else {mode: uri}
 
     resp = await _api("PUT", "/me/player/play", token, params={"device_id": device_id}, json=body)
     if not resp or resp.status_code not in (200, 202, 204):
         code = resp.status_code if resp else "no response"
-        return PlaybackResult(False, f"playback failed ({code})")
+        return PlaybackResult(False, f"la lecture a échoué ({code})")
     return PlaybackResult(True, label or "resumed")
 
 
 async def pause() -> PlaybackResult:
     token = await get_access_token()
     if not token:
-        return PlaybackResult(False, "Spotify isn't connected")
+        return PlaybackResult(False, "Spotify n'est pas connecté")
     resp = await _api("PUT", "/me/player/pause", token)
     if not resp or resp.status_code not in (200, 202, 204):
         return PlaybackResult(False, "pause failed")
@@ -284,7 +284,7 @@ async def pause() -> PlaybackResult:
 async def next_track() -> PlaybackResult:
     token = await get_access_token()
     if not token:
-        return PlaybackResult(False, "Spotify isn't connected")
+        return PlaybackResult(False, "Spotify n'est pas connecté")
     resp = await _api("POST", "/me/player/next", token)
     if not resp or resp.status_code not in (200, 202, 204):
         return PlaybackResult(False, "skip failed")
@@ -307,25 +307,25 @@ async def current_track() -> NowPlaying | None:
 
 
 # ---------------------------------------------------------------------------
-# Voice formatting (British butler tone, 1-2 sentences)
+# Voice formatting (French, affectionate "mon amour" address, 1-2 sentences)
 # ---------------------------------------------------------------------------
 
 def format_play(result: PlaybackResult) -> str:
     if result.ok:
         if result.detail in ("resumed", ""):
-            return "Resuming, sir."
-        return f"Playing {result.detail}, sir."
-    if result.detail == "Spotify isn't connected":
-        return "Spotify isn't connected yet, sir. Add the credentials and I'll handle the rest."
-    return f"I couldn't start playback, sir — {result.detail}."
+            return "Je reprends, mon amour."
+        return f"Je lance {result.detail}, mon amour."
+    if result.detail == "Spotify n'est pas connecté":
+        return "Spotify n'est pas encore connecté, mon amour. Ajoute les identifiants et je m'occupe du reste."
+    return f"Je n'ai pas pu lancer la lecture, mon amour — {result.detail}."
 
 
 def format_now_playing(now: NowPlaying | None) -> str:
     if not now or not now.name:
-        return "Nothing is playing at the moment, sir."
-    by = f" by {now.artist}" if now.artist else ""
-    verb = "Currently playing" if now.is_playing else "Paused on"
-    return f"{verb} {now.name}{by}, sir."
+        return "Rien ne joue pour le moment, mon amour."
+    by = f" de {now.artist}" if now.artist else ""
+    verb = "En lecture :" if now.is_playing else "En pause sur"
+    return f"{verb} {now.name}{by}, mon amour."
 
 
 # ---------------------------------------------------------------------------
