@@ -1602,27 +1602,35 @@ def detect_action_fast(text: str) -> dict | None:
         return {"action": "check_mail"}
 
     # Music — pause / skip / now-playing (checked before "play" so they win)
-    if any(p in t for p in ["pause the music", "pause music", "pause la musique", "mets pause",
-                            "stop the music", "stop music", "arrête la musique", "arrete la musique"]):
+    if t in ("pause", "stop", "pause.", "stop.") or any(p in t for p in [
+            "pause the music", "pause music", "pause la musique", "mets pause", "mets sur pause",
+            "sur pause", "stop the music", "stop music", "stop la musique", "arrête la musique",
+            "arrete la musique", "stoppe la musique", "coupe la musique", "coupe le son"]):
         return {"action": "pause_music"}
-    if any(p in t for p in ["next track", "next song", "skip this", "skip the song",
-                            "morceau suivant", "chanson suivante", "passe la chanson", "musique suivante"]):
+    if t in ("suivant", "next", "next track", "skip") or any(p in t for p in [
+            "next track", "next song", "skip this", "skip the song", "morceau suivant",
+            "chanson suivante", "musique suivante", "titre suivant", "passe la chanson",
+            "passe au suivant", "passe à la suivante", "passe a la suivante", "change de chanson",
+            "chanson d'après", "morceau d'après"]):
         return {"action": "next_track"}
     if any(p in t for p in ["what's playing", "whats playing", "what song is this", "what is this song",
-                            "c'est quoi ce morceau", "c'est quoi cette chanson", "quelle chanson",
-                            "qu'est-ce qui joue", "quel morceau"]):
+                            "c'est quoi ce morceau", "c'est quoi cette chanson", "c'est quoi cette musique",
+                            "c'est quoi la chanson", "quel est ce morceau", "quelle chanson", "quel morceau",
+                            "qu'est-ce qui joue", "qu'est ce qui joue", "ça joue quoi", "ca joue quoi",
+                            "quelle est cette chanson", "c'est quel morceau"]):
         return {"action": "music_status"}
-    # Music — "play some music" with no specific target (resume / general).
-    if any(p in t for p in ["play some music", "put on some music", "mets de la musique",
-                            "mets un peu de musique", "lance la musique", "play music",
-                            "de la musique", "some music"]):
+    # Music — general "play some music" with no specific target (resume / general).
+    if any(p in t for p in ["play some music", "put on some music", "play music",
+                            "mets de la musique", "mets un peu de musique", "remets de la musique",
+                            "lance la musique", "remets la musique", "reprends la musique",
+                            "joue de la musique", "de la musique", "some music"]):
         return {"action": "play_music", "query": ""}
     # Music — play a specific song/artist/playlist. Capture the query after the verb.
-    for prefix in ["play ", "put on ", "mets ", "joue ", "lance "]:
+    for prefix in ["play ", "put on ", "mets-moi ", "joue-moi ", "mets ", "joue ", "lance ", "balance "]:
         if t.startswith(prefix):
             query = text.strip()[len(prefix):].strip()
-            # Avoid hijacking non-music phrasing like "play it again" with no target
-            if query and not query.lower().startswith(("it ", "that ", "it", "that")):
+            # Avoid hijacking non-music phrasing like "play it again" / "mets ça" with no target
+            if query and not query.lower().startswith(("it ", "that ", "it", "that", "ça", "ca ", "le son")):
                 return {"action": "play_music", "query": query}
 
     # Dispatch / build status check
