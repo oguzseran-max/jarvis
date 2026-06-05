@@ -37,6 +37,12 @@ REVX_BASE_URL = os.getenv("REVOLUT_X_BASE_URL", "https://revx.revolut.com").rstr
 REVX_API_KEY = os.getenv("REVOLUT_X_API_KEY", "").strip()
 REVX_PRIVATE_KEY_PATH = os.getenv("REVOLUT_X_PRIVATE_KEY", "").strip()
 REVX_BALANCES_PATH = "/api/1.0/balances"
+# Public market-data tickers (no auth) — used to value crypto holdings in fiat.
+REVX_TICKERS_PATH = os.getenv("REVOLUT_X_TICKERS_PATH", "/api/1.0/market/tickers")
+
+# Fiat currency that crypto holdings are valued in (must be a quote currency on
+# Revolut X, e.g. USD/EUR/GBP). Each holding is priced against "<SYMBOL>-<quote>".
+VALUE_CURRENCY = os.getenv("REVOLUT_VALUE_CURRENCY", "USD").upper()
 
 # Stocks (Revolut Invest) — manual file, no official API
 STOCKS_FILE = os.getenv(
@@ -177,10 +183,68 @@ def parse_balances(raw) -> list[Holding]:
     return holdings
 
 
+def parse_tickers(raw, quote: str) -> dict[str, float]:
+    """Parse a tickers payload into {base_symbol: last_price}. Defensive.
+
+    Only pairs quoted in `quote` (e.g. BTC-USD when quote=USD) are kept. The
+    last/current price is read from the first present of several common field
+    names so we don't depend on one exact schema.
+    """
+    items = raw.get("tickers", raw) if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return {}
+
+    quote = quote.upper()
+    suffix = f"-{quote}"
+    prices: dict[str, float] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or item.get("pair") or item.get("currency_pair") or "").upper()
+        if not symbol.endswith(suffix):
+            continue
+        base = symbol[: -len(suffix)]
+        price = None
+        for key in ("last", "last_price", "price", "close", "mark_price"):
+            if item.get(key) is not None:
+                price = _coerce_float(item.get(key))
+                break
+        if price and price > 0:
+            prices[base] = price
+    return prices
+
+
+async def get_crypto_prices(symbols: list[str], quote: str | None = None) -> dict[str, float]:
+    """Fetch last prices for `symbols` from Revolut X public market data.
+
+    Best-effort: returns {} on any failure so valuation never blocks a balance
+    read. No auth — market data is public.
+    """
+    quote = (quote or VALUE_CURRENCY).upper()
+    symbols = [s for s in symbols if s]
+    if not symbols:
+        return {}
+
+    try:
+        pairs = ",".join(f"{s}-{quote}" for s in symbols)
+        url = f"{REVX_BASE_URL}{REVX_TICKERS_PATH}"
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(url, params={"symbols": pairs})
+        if resp.status_code != 200:
+            log.warning(f"Revolut X tickers returned {resp.status_code}: {resp.text[:200]}")
+            return {}
+        return parse_tickers(resp.json(), quote)
+    except Exception as e:
+        log.warning(f"Revolut X price fetch failed: {e}")
+        return {}
+
+
 async def get_crypto_holdings() -> tuple[list[Holding], str | None]:
     """Fetch crypto balances from Revolut X. Returns (holdings, error_or_None).
 
-    Never raises — degrades gracefully when unconfigured or the API is down.
+    Holdings are valued in VALUE_CURRENCY when a market price is available
+    (best-effort). Never raises — degrades gracefully when unconfigured, when
+    the API is down, or when prices can't be fetched.
     """
     if not is_crypto_configured():
         return [], None  # Not configured is not an error — crypto is optional.
@@ -193,10 +257,19 @@ async def get_crypto_holdings() -> tuple[list[Holding], str | None]:
             msg = f"Revolut X returned {resp.status_code}"
             log.warning(f"{msg}: {resp.text[:200]}")
             return [], msg
-        return parse_balances(resp.json()), None
+        holdings = parse_balances(resp.json())
     except Exception as e:
         log.warning(f"Revolut X balance fetch failed: {e}")
         return [], f"crypto unavailable ({type(e).__name__})"
+
+    # Best-effort fiat valuation — leaves value=None for any unpriced asset.
+    prices = await get_crypto_prices([h.symbol for h in holdings])
+    for h in holdings:
+        price = prices.get(h.symbol)
+        if price is not None:
+            h.value = round(h.quantity * price, 2)
+            h.currency = VALUE_CURRENCY
+    return holdings, None
 
 
 # ---------------------------------------------------------------------------

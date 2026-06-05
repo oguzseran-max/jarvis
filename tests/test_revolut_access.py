@@ -11,15 +11,47 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import pytest
+
 import revolut_access as ra
 from revolut_access import (
     Holding,
     Portfolio,
     format_portfolio_for_context,
     format_portfolio_summary,
+    get_crypto_holdings,
+    get_crypto_prices,
     get_stock_holdings,
     parse_balances,
+    parse_tickers,
 )
+
+
+# --- Fake async httpx client (no network) ----------------------------------
+
+class _FakeResp:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    """Stands in for httpx.AsyncClient; returns canned payloads per call order."""
+    def __init__(self, payloads):
+        self._payloads = list(payloads)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, *args, **kwargs):
+        return self._payloads.pop(0)
 
 
 # --- parse_balances --------------------------------------------------------
@@ -169,3 +201,84 @@ def test_is_crypto_configured_false_without_keys(monkeypatch):
     monkeypatch.setattr(ra, "REVX_API_KEY", "")
     monkeypatch.setattr(ra, "REVX_PRIVATE_KEY_PATH", "")
     assert ra.is_crypto_configured() is False
+
+
+# --- Fiat valuation: parse_tickers -----------------------------------------
+
+def test_parse_tickers_filters_quote_and_reads_last():
+    raw = [
+        {"symbol": "BTC-USD", "last": "90000.5"},
+        {"symbol": "ETH-EUR", "last": "3000"},   # wrong quote -> skipped
+        {"symbol": "SOL-USD", "price": "150.25"}, # alias price field
+    ]
+    prices = parse_tickers(raw, "USD")
+    assert prices == {"BTC": 90000.5, "SOL": 150.25}
+
+
+def test_parse_tickers_dict_wrapper_and_bad_rows():
+    raw = {"tickers": [
+        {"pair": "BTC-USD", "close": "88000"},
+        {"symbol": "BAD-USD"},        # no price -> skipped
+        "garbage",                     # not a dict -> skipped
+        {"symbol": "ETH-USD", "last": "0"},  # zero -> skipped
+    ]}
+    assert parse_tickers(raw, "USD") == {"BTC": 88000.0}
+
+
+def test_parse_tickers_handles_garbage():
+    assert parse_tickers("nonsense", "USD") == {}
+
+
+# --- Fiat valuation: get_crypto_prices (mocked network) --------------------
+
+@pytest.mark.asyncio
+async def test_get_crypto_prices_empty_symbols_skips_network():
+    assert await get_crypto_prices([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_get_crypto_prices_fetches_and_parses(monkeypatch):
+    payload = [{"symbol": "BTC-USD", "last": "90000"}, {"symbol": "ETH-USD", "last": "3000"}]
+    monkeypatch.setattr(ra.httpx, "AsyncClient", lambda *a, **k: _FakeClient([_FakeResp(payload)]))
+    prices = await get_crypto_prices(["BTC", "ETH"], quote="USD")
+    assert prices == {"BTC": 90000.0, "ETH": 3000.0}
+
+
+@pytest.mark.asyncio
+async def test_get_crypto_prices_non_200_returns_empty(monkeypatch):
+    monkeypatch.setattr(ra.httpx, "AsyncClient", lambda *a, **k: _FakeClient([_FakeResp({}, status_code=500)]))
+    assert await get_crypto_prices(["BTC"]) == {}
+
+
+# --- Fiat valuation: end-to-end holdings get valued ------------------------
+
+@pytest.mark.asyncio
+async def test_get_crypto_holdings_values_in_fiat(monkeypatch):
+    balances = [{"currency": "BTC", "available": "0.5", "staked": "0", "reserved": "0"}]
+    tickers = [{"symbol": "BTC-USD", "last": "90000"}]
+    # First GET returns balances, second GET (prices) returns tickers.
+    monkeypatch.setattr(ra, "is_crypto_configured", lambda: True)
+    monkeypatch.setattr(ra, "_signed_headers", lambda *a, **k: {})
+    monkeypatch.setattr(ra, "VALUE_CURRENCY", "USD")
+    # Two separate AsyncClient() calls: balances first, then prices.
+    clients = iter([_FakeClient([_FakeResp(balances)]), _FakeClient([_FakeResp(tickers)])])
+    monkeypatch.setattr(ra.httpx, "AsyncClient", lambda *a, **k: next(clients))
+    holdings, err = await get_crypto_holdings()
+    assert err is None
+    assert len(holdings) == 1
+    btc = holdings[0]
+    assert btc.symbol == "BTC"
+    assert btc.value == 45000.0  # 0.5 * 90000
+    assert btc.currency == "USD"
+
+
+@pytest.mark.asyncio
+async def test_get_crypto_holdings_unpriced_leaves_value_none(monkeypatch):
+    balances = [{"currency": "XYZ", "available": "10", "staked": "0", "reserved": "0"}]
+    monkeypatch.setattr(ra, "is_crypto_configured", lambda: True)
+    monkeypatch.setattr(ra, "_signed_headers", lambda *a, **k: {})
+    clients = iter([_FakeClient([_FakeResp(balances)]), _FakeClient([_FakeResp([])])])
+    monkeypatch.setattr(ra.httpx, "AsyncClient", lambda *a, **k: next(clients))
+    holdings, err = await get_crypto_holdings()
+    assert err is None
+    assert holdings[0].value is None  # no price -> quantity-only, graceful
