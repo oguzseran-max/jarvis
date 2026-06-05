@@ -1957,6 +1957,24 @@ return windowList
     log.info("Context refresh thread started")
 
 
+async def _hourly_context_refresh():
+    """Keep the slower ambient context fresh so JARVIS always has up-to-date
+    information without the user having to ask.
+
+    The sync thread above already refreshes weather/screen (~30s) and news
+    (~5 min) — all well under an hour. Calendar and mail were only fetched
+    on demand, so this drives them too: once at startup, then every hour.
+    Both `_do_*_lookup` helpers update `_ctx_cache` as a side effect.
+    """
+    while True:
+        for name, fn in (("calendar", _do_calendar_lookup), ("mail", _do_mail_lookup)):
+            try:
+                await fn()
+            except Exception as e:
+                log.debug(f"hourly {name} refresh failed: {e}")
+        await asyncio.sleep(3600)  # every hour
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global anthropic_client, cached_projects
@@ -1968,6 +1986,9 @@ async def lifespan(application: FastAPI):
 
     # Start context refresh in a separate thread (never touches event loop)
     _refresh_context_sync()
+    # Hourly refresh of the on-demand sources (calendar + mail) so the cache is
+    # never more than an hour stale; weather/news/screen refresh faster above.
+    asyncio.create_task(_hourly_context_refresh())
     self_eval.init()  # continuous self-improvement (Phase 1)
     log.info("JARVIS server starting")
 

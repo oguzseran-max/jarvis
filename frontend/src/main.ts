@@ -96,9 +96,9 @@ const gateCam = (function gateCam() {
     #gate-cam img { display: block; width: 100%; height: 92px; object-fit: cover; background:#05070c; }
 
     /* ── Centre-screen spotlight (on ring) ───────────────────────────────── */
-    #gate-spot { position: fixed; left: 50%; top: 52%; z-index: 30;
-      width: min(640px, 74vw); pointer-events: auto; cursor: pointer;
-      transform: translate(-50%,-50%) scale(0.35) rotateX(10deg);
+    #gate-spot { position: fixed; left: 50%; top: 62%; z-index: 60;
+      width: min(880px, 90vw); pointer-events: auto; cursor: pointer;
+      transform: translate(-50%,-50%) scale(0.82) rotateX(8deg);
       opacity: 0; visibility: hidden;
       transition: opacity .45s ease, transform .7s cubic-bezier(.16,.9,.2,1.25), visibility .45s;
       border: 1px solid rgba(${C},0.65); border-radius: 14px; overflow: hidden;
@@ -114,7 +114,7 @@ const gateCam = (function gateCam() {
       box-shadow: 0 0 10px #ff3b3b; animation: gcblink 0.9s ease-in-out infinite; }
     #gate-spot .gs-head .grow { flex: 1; }
     #gate-spot .gs-hint { font-size: 8px; letter-spacing: 1.5px; color: rgba(${C},0.55); }
-    #gate-spot img { display: block; width: 100%; height: min(400px, 48vh);
+    #gate-spot img { display: block; width: 100%; height: min(560px, 66vh);
       object-fit: cover; background: #05070c; }
     /* sweeping scanline + corner brackets for the futuristic feel */
     #gate-spot .gs-scan { position: absolute; left: 0; right: 0; top: 38px; height: 2px;
@@ -158,11 +158,14 @@ const gateCam = (function gateCam() {
     window.clearTimeout(hideTimer);
     spot.classList.remove("show");
     spotImg.src = "";          // stop the spotlight stream
-    img.src = VIDEO;           // resume the small live panel
+    box.style.display = "";    // bring the small live panel back
+    img.src = VIDEO;
   }
   function ringAlert() {
+    console.log("[gate] ring → camera spotlight");
     window.clearTimeout(hideTimer);
-    img.src = "";              // free the single DoorBird stream for the spotlight
+    box.style.display = "none"; // hide the small panel entirely (no "shrink")
+    img.src = "";               // free the single DoorBird stream for the spotlight
     spotImg.src = VIDEO;
     spot.classList.add("show");
     hideTimer = window.setTimeout(close, 22000);  // auto-dismiss after ~22s
