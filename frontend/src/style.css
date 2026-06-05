@@ -18,6 +18,14 @@ html, body {
   left: 0;
   width: 100%;
   height: 100%;
+  transition: transform 0.7s ease;
+  transform-origin: center 50%;
+}
+
+/* Marion personas (FR/TR): shrink the orb into a glowing core behind her torso
+   instead of hiding it. Marion's transparent cutout sits on top (z-index 1). */
+body.marion-mode #orb-canvas {
+  transform: translateY(-4vh) scale(1);
 }
 
 #status-text {
@@ -449,6 +457,15 @@ html, body {
   border-color: rgba(120, 180, 255, 0.8);
 }
 
+/* Subtle cinematic vignette over the orb (below the boot overlay + controls) */
+#vignette {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 58%, rgba(0,0,0,0.45) 100%);
+}
+
 /* Boot sequence overlay */
 #boot-overlay {
   position: fixed;
@@ -458,7 +475,8 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: opacity 1.2s ease;
+  /* long eased fade so the boot crossfades into the orb rather than cutting */
+  transition: opacity 2.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 #boot-overlay.done {
   opacity: 0;
@@ -470,6 +488,159 @@ html, body {
   object-fit: contain;
   background: #000;
 }
+
+/* ── Cinematic boot HUD (real-time WebGL + vector overlay) ─────────────── */
+.boot-gl {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.boot-hud {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  color: #bfe6ff;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  /* cinematic vignette + faint scan grid */
+  background:
+    radial-gradient(ellipse at center, transparent 48%, rgba(0,0,0,0.7) 100%),
+    repeating-linear-gradient(0deg, rgba(90,200,255,0.020) 0 1px, transparent 1px 3px);
+  opacity: 0;
+  transition: opacity 0.8s ease;
+}
+.boot-hud.live { opacity: 1; }
+.boot-hud.out { opacity: 0; transition: opacity 1.4s ease; }
+
+/* letterbox bars slide in for the boot, retract just before the handoff */
+.boot-bar {
+  position: absolute;
+  left: 0; right: 0;
+  height: 8vh;
+  background: #000;
+  z-index: 3;
+  transition: transform 0.9s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.boot-bar.top { top: 0; transform: translateY(-100%); }
+.boot-bar.bottom { bottom: 0; transform: translateY(100%); }
+.boot-hud.live .boot-bar { transform: translateY(0); }
+.boot-hud.out .boot-bar.top { transform: translateY(-100%); }
+.boot-hud.out .boot-bar.bottom { transform: translateY(100%); }
+
+/* animated film grain */
+.boot-grain {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0.06;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+  animation: bootGrain 0.45s steps(3) infinite;
+}
+@keyframes bootGrain {
+  0% { background-position: 0 0; }
+  100% { background-position: 130px 90px; }
+}
+
+/* corner brackets draw in */
+.boot-bracket {
+  position: absolute;
+  width: 46px; height: 46px;
+  border: 2px solid rgba(120,210,255,0.5);
+  opacity: 0;
+  animation: bootBracket 1s ease forwards;
+}
+.boot-hud.live .boot-bracket { animation-delay: 0.4s; }
+.boot-bracket.tl { top: 22px; left: 22px; border-right: 0; border-bottom: 0; }
+.boot-bracket.tr { top: 22px; right: 22px; border-left: 0; border-bottom: 0; }
+.boot-bracket.bl { bottom: 22px; left: 22px; border-right: 0; border-top: 0; }
+.boot-bracket.br { bottom: 22px; right: 22px; border-left: 0; border-top: 0; }
+@keyframes bootBracket { from { opacity: 0; transform: scale(1.4); } to { opacity: 1; transform: scale(1); } }
+
+/* arc reactor svg — centred, layered over the 3D core */
+.boot-reactor {
+  position: absolute;
+  top: 50%; left: 50%;
+  width: min(78vmin, 560px); height: min(78vmin, 560px);
+  transform: translate(-50%, -50%);
+  filter: drop-shadow(0 0 14px rgba(90,200,255,0.35));
+}
+.boot-seg  { transform-origin: 200px 200px; animation: bootSpin 14s linear infinite; }
+.boot-seg2 { transform-origin: 200px 200px; animation: bootSpin 9s linear infinite reverse; }
+@keyframes bootSpin { to { transform: rotate(360deg); } }
+
+/* vertical scan sweep */
+.boot-scan {
+  position: absolute;
+  left: 0; right: 0; height: 2px; top: 0;
+  background: linear-gradient(90deg, transparent, rgba(120,210,255,0.55), transparent);
+  box-shadow: 0 0 18px rgba(120,210,255,0.5);
+  opacity: 0;
+}
+.boot-hud.live .boot-scan { animation: bootScan 5.5s ease-in-out 4s infinite; }
+@keyframes bootScan {
+  0% { top: 8%; opacity: 0; }
+  10% { opacity: 0.9; }
+  90% { opacity: 0.9; }
+  100% { top: 92%; opacity: 0; }
+}
+
+/* streaming diagnostics columns */
+.boot-col {
+  position: absolute;
+  top: 50%; transform: translateY(-50%);
+  width: 232px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  opacity: 0;
+  transition: opacity 0.6s ease;
+}
+.boot-hud.diag .boot-col { opacity: 0.85; }
+.boot-col.left  { left: 40px; text-align: left; }
+.boot-col.right { right: 40px; text-align: right; }
+.boot-line {
+  display: flex; justify-content: space-between; gap: 10px;
+  padding: 2px 0;
+  color: rgba(150,210,255,0.7);
+  animation: bootLineIn 0.35s ease;
+}
+.boot-col.right .boot-line { flex-direction: row-reverse; }
+.boot-line em { font-style: normal; }
+.boot-line em.ok   { color: #5ad27a; }
+.boot-line em.wait { color: #ffb24a; }
+@keyframes bootLineIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* bottom status rail — elevated INITIATING SYSTEM */
+.boot-rail {
+  position: absolute;
+  left: 50%; bottom: 7%;
+  transform: translateX(-50%);
+  display: flex; align-items: center; gap: 16px;
+  width: min(620px, 78vw);
+  font-size: 11px; letter-spacing: 0.24em;
+  color: rgba(150,210,255,0.85);
+}
+.boot-rail-title { white-space: nowrap; text-shadow: 0 0 12px rgba(90,200,255,0.6); }
+.boot-bar {
+  position: relative; flex: 1; height: 6px;
+  border: 1px solid rgba(90,200,255,0.4); border-radius: 3px; overflow: hidden;
+  background: rgba(90,200,255,0.06);
+}
+.boot-bar i {
+  position: absolute; inset: 0; width: 0%;
+  background: linear-gradient(90deg, #5ac8ff, #ffb24a);
+  box-shadow: 0 0 14px rgba(120,210,255,0.8);
+}
+.boot-tokens { display: flex; gap: 12px; white-space: nowrap; }
+.boot-tokens b {
+  font-weight: 600; color: rgba(120,160,200,0.45);
+  transition: color 0.3s ease, text-shadow 0.3s ease;
+}
+.boot-tokens b.on { color: #5ad27a; text-shadow: 0 0 10px rgba(90,210,120,0.7); }
+
 #boot-hint {
   position: absolute;
   bottom: 12%;
@@ -485,59 +656,132 @@ html, body {
 }
 @keyframes bootpulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
 
-/* Red HUD loading graphic (overlays the boot video's black tail) */
-#boot-loading {
-  position: absolute;
+/* ── Persistent corner HUD — Hollywood monitoring panels ───────────────────
+   Always-on once JARVIS is loaded; fades in at the boot → orb handoff. Sits
+   above the orb + vignette, below the boot overlay and the controls/menu. */
+.hud-corners {
+  position: fixed;
   inset: 0;
+  z-index: 60;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 1.6s ease;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  color: rgba(150, 210, 255, 0.72);
+}
+.hud-corners.live { opacity: 1; }
+
+.hud-corner {
+  position: absolute;
+  width: 196px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+.hud-corner.tl { top: 56px; left: 18px; }
+.hud-corner.tr { top: 56px; right: 18px; text-align: right; }
+.hud-corner.bl { bottom: 22px; left: 18px; }
+.hud-corner.br { bottom: 22px; right: 18px; text-align: right; }
+
+.hud-head {
   display: flex;
   align-items: center;
-  justify-content: center;
-  opacity: 0;
-  transition: opacity 0.6s ease;
-  background:
-    repeating-linear-gradient(0deg, rgba(255,40,40,0.05) 0 1px, transparent 1px 34px),
-    repeating-linear-gradient(90deg, rgba(255,40,40,0.05) 0 1px, transparent 1px 34px);
-  pointer-events: none;
+  gap: 7px;
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  color: rgba(120, 210, 255, 0.92);
+  text-shadow: 0 0 10px rgba(90, 200, 255, 0.5);
+  padding-bottom: 5px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid rgba(120, 210, 255, 0.18);
 }
-#boot-loading.show { opacity: 1; }
-.bl-frame {
-  width: min(640px, 80vw);
-  padding: 26px 30px;
-  border: 1px solid rgba(255,60,60,0.5);
-  border-radius: 6px;
-  box-shadow: 0 0 30px rgba(255,40,40,0.25), inset 0 0 20px rgba(255,40,40,0.08);
-  background: rgba(20,0,0,0.35);
-  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+.hud-corner.tr .hud-head, .hud-corner.br .hud-head { justify-content: flex-end; }
+.hud-spark {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #ffb24a;
+  box-shadow: 0 0 8px #ffb24a;
+  animation: hudSpark 1.3s ease-in-out infinite;
 }
-.bl-title {
-  color: #ff5a5a;
-  font-size: 18px;
-  letter-spacing: 0.32em;
-  text-shadow: 0 0 12px rgba(255,60,60,0.9);
-  margin-bottom: 16px;
+@keyframes hudSpark { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }
+
+/* top-left status rows */
+.hud-row { display: flex; align-items: center; gap: 7px; padding: 2px 0; }
+.hud-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #5ad27a; box-shadow: 0 0 7px rgba(90, 210, 120, 0.8);
+  animation: hudSpark 1.8s ease-in-out infinite;
 }
-.bl-title::after { content: " ▾▾▾"; animation: bldots 1s steps(3) infinite; }
-@keyframes bldots { 0%{opacity:.2} 50%{opacity:1} 100%{opacity:.2} }
-.bl-bar {
-  height: 16px;
-  border: 1px solid rgba(255,60,60,0.6);
-  border-radius: 3px;
-  overflow: hidden;
-  background: rgba(255,40,40,0.06);
+.hud-k { flex: 1; color: rgba(150, 200, 240, 0.7); }
+.hud-v { color: #9fe0ff; font-variant-numeric: tabular-nums; }
+
+/* top-right scan ring */
+.hud-ringwrap { position: relative; width: 86px; height: 86px; margin: 2px 0 6px; }
+.hud-corner.tr .hud-ringwrap { margin-left: auto; }
+.hud-ring { width: 86px; height: 86px; overflow: visible; }
+.hud-ring-bg { fill: none; stroke: rgba(120, 210, 255, 0.12); stroke-width: 1; }
+.hud-ring-spin { transform-origin: 50px 50px; animation: hudSpin 6s linear infinite; }
+.hud-ring-arc {
+  fill: none; stroke: #5ac8ff; stroke-width: 2; stroke-linecap: round;
+  stroke-dasharray: 70 194; filter: drop-shadow(0 0 4px rgba(90, 200, 255, 0.7));
 }
-.bl-fill {
-  height: 100%;
-  width: 0%;
-  background: repeating-linear-gradient(90deg, #ff3a3a 0 10px, #b81f1f 10px 14px);
-  box-shadow: 0 0 16px rgba(255,50,50,0.9);
+.hud-ring-arc2 {
+  fill: none; stroke: rgba(255, 178, 74, 0.8); stroke-width: 1.5; stroke-linecap: round;
+  stroke-dasharray: 30 184;
 }
-#boot-loading.show .bl-fill { animation: blfill 8.4s linear forwards; }
-@keyframes blfill { from { width: 0%; } to { width: 100%; } }
-.bl-status {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 14px;
-  color: rgba(255,120,120,0.8);
-  font-size: 11px;
-  letter-spacing: 0.18em;
+.hud-ring-ticks line { stroke: rgba(120, 210, 255, 0.35); stroke-width: 1; }
+.hud-ring-pct {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 15px; color: #cfeeff; text-shadow: 0 0 10px rgba(90, 200, 255, 0.6);
+  font-variant-numeric: tabular-nums;
+}
+@keyframes hudSpin { to { transform: rotate(360deg); } }
+
+/* thin bars (scan) */
+.hud-bar {
+  position: relative; height: 4px; border-radius: 2px;
+  background: rgba(90, 200, 255, 0.1); overflow: hidden;
+  border: 1px solid rgba(90, 200, 255, 0.25);
+}
+.hud-bar i {
+  position: absolute; inset: 0; width: 0%;
+  background: linear-gradient(90deg, #5ac8ff, #ffb24a);
+  box-shadow: 0 0 8px rgba(120, 210, 255, 0.8);
+}
+
+/* bottom-left diagnostics feed */
+.hud-feed { display: flex; flex-direction: column; gap: 2px; }
+.hud-feedline {
+  display: flex; justify-content: space-between; gap: 8px;
+  color: rgba(150, 205, 245, 0.62);
+  animation: hudFeedIn 0.3s ease;
+}
+.hud-feedline em { font-style: normal; }
+.hud-feedline em.ok { color: #5ad27a; }
+.hud-feedline em.wait { color: #ffb24a; }
+@keyframes hudFeedIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+
+/* bottom-right telemetry */
+.hud-telemetry { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
+.hud-reticle { width: 58px; height: 58px; overflow: visible; flex: none; }
+.hud-ret-c { fill: none; stroke: rgba(120, 210, 255, 0.25); stroke-width: 1; }
+.hud-ret-spin { transform-origin: 50px 50px; animation: hudSpin 8s linear infinite reverse; }
+.hud-ret-arc { fill: none; stroke: #5ac8ff; stroke-width: 2; filter: drop-shadow(0 0 4px rgba(90, 200, 255, 0.7)); }
+.hud-ret-x { stroke: rgba(120, 210, 255, 0.5); stroke-width: 1; }
+.hud-tele-text { text-align: right; }
+.hud-clock {
+  font-size: 16px; color: #cfeeff; letter-spacing: 0.08em;
+  text-shadow: 0 0 10px rgba(90, 200, 255, 0.55); font-variant-numeric: tabular-nums;
+}
+.hud-line { display: flex; justify-content: flex-end; gap: 8px; color: rgba(150, 200, 240, 0.62); }
+.hud-line b { color: #9fe0ff; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* state reactivity */
+.hud-corners.state-thinking .hud-ring-spin { animation-duration: 1.6s; }
+.hud-corners.state-thinking .hud-ret-spin { animation-duration: 2.6s; }
+.hud-corners.state-speaking .hud-corner.tl { animation: hudPulse 0.9s ease-in-out infinite; }
+.hud-corners.state-speaking .hud-ring-arc { stroke: #9fe0ff; }
+@keyframes hudPulse { 0%,100% { opacity: 0.8; } 50% { opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .hud-ring-spin, .hud-ret-spin, .hud-spark, .hud-dot,
+  .hud-corners.state-speaking .hud-corner.tl { animation: none; }
 }

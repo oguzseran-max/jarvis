@@ -48,3 +48,9 @@ context/
 # Gmail OAuth secrets
 gmail_credentials.json
 gmail_token.json
+
+# boot audio build tooling
+.audio-venv/
+tools/boot_build/sep/
+tools/boot_build/voice/
+tools/boot_build/shot_*.png

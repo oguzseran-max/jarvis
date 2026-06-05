@@ -7,31 +7,34 @@
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
-    <!-- Boot sequence — machine sound + HUD loading video, then fades to the orb -->
+    <!-- Boot sequence — cinematic real-time HUD (boot.ts). Two audio tracks:
+         #boot-music loops forever (drops to a faint ambient level at the orb
+         handoff, never stops); #boot-audio plays the one-shot voice line. -->
     <div id="boot-overlay">
-      <video id="boot-video" src="/boot_silent.mp4" muted playsinline preload="auto"></video>
+      <audio id="boot-music" preload="auto"></audio>
       <audio id="boot-audio" preload="auto"></audio>
-      <div id="boot-loading">
-        <div class="bl-frame">
-          <div class="bl-title">INITIATING SYSTEM</div>
-          <div class="bl-bar"><div class="bl-fill"></div></div>
-          <div class="bl-status"><span>CHECKSUM: OK</span><span>MEMORY: OK</span><span>CORE: ONLINE</span></div>
-        </div>
-      </div>
       <div id="boot-hint">select language (top-left) · click to initialize JARVIS</div>
     </div>
 
     <canvas id="orb-canvas"></canvas>
+    <!-- Subtle cinematic vignette over the orb -->
+    <div id="vignette"></div>
 
     <!-- Language toggle — forces speech recognition + replies to a language -->
     <div id="lang-select">
-      <button class="lang-btn active" data-lang="en" title="English">EN</button>
-      <button class="lang-btn" data-lang="fr" title="Français">FR</button>
+      <button class="lang-btn" data-lang="en" title="English">EN</button>
+      <button class="lang-btn active" data-lang="fr" title="Français">FR</button>
       <button class="lang-btn" data-lang="tr" title="Türkçe">TR</button>
     </div>
 
     <!-- Minimal controls — top right -->
     <div id="controls">
+      <button id="btn-avatar" title="Open avatar (new tab)">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="12" cy="7" r="4"/>
+          <path d="M5.5 21a6.5 6.5 0 0 1 13 0"/>
+        </svg>
+      </button>
       <button id="btn-mute" title="Mute/Unmute">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
           <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>

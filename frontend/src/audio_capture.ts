@@ -21,7 +21,7 @@ const START_MULT = 3.5;
 const STOP_MULT = 2.0;
 const START_FLOOR = 0.006;
 const STOP_FLOOR = 0.0035;
-const SILENCE_MS = 900; // trailing silence that ends an utterance
+const SILENCE_MS = 650; // trailing silence that ends an utterance (lower = snappier)
 const MIN_UTTER_MS = 500; // ignore blips shorter than this
 const MAX_UTTER_MS = 18000; // force-flush very long utterances
 const POLL_MS = 40;
@@ -100,49 +100,63 @@ export function createAudioCapture(
     timer = window.setTimeout(poll, POLL_MS);
   }
 
+  // Idempotent: once the mic pipeline is live, repeat calls just unpause. A
+  // separate guard (`starting`) coalesces concurrent start attempts so two
+  // callers can't both run getUserMedia.
+  let started = false;
+  let starting = false;
+  async function startCapture() {
+    if (started) { paused = false; return; }
+    if (starting) return;
+    starting = true;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        // Keep Chrome's voice pipeline ON — its auto-gain is what brings the
+        // mic up to a usable level (disabling it gave near-silent audio).
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      ctx = new AudioContext();
+      const wake = () => { if (ctx && ctx.state === "suspended") ctx.resume(); };
+      document.addEventListener("click", wake);
+      document.addEventListener("keydown", wake);
+      await ctx.resume().catch(() => {});
+
+      // Record the RAW mic stream directly (the standard pattern). The
+      // analyser is only a passive level tap for VAD — it never sits in the
+      // recording path, so it can't corrupt the audio. The server peak-
+      // normalizes, so exact capture level isn't critical.
+      const src = ctx.createMediaStreamSource(stream);
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      buf = new Float32Array(analyser.fftSize);
+      src.connect(analyser);
+
+      recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) parts.push(e.data); };
+      recorder.onstop = () => {
+        const keep = (recorder as any)._keep;
+        const blob = new Blob(parts, { type: mime || "audio/webm" });
+        parts = [];
+        if (keep && blob.size > 0) blob.arrayBuffer().then(onUtterance);
+      };
+
+      started = true;
+      paused = false;
+      timer = window.setTimeout(poll, POLL_MS);
+      console.log("[capture] started; mime=", mime, "ctx.sampleRate=", ctx.sampleRate);
+    } catch (e: any) {
+      onError(
+        e && e.name === "NotAllowedError"
+          ? "Microphone access denied. Please allow microphone access."
+          : "Could not start the microphone."
+      );
+    } finally {
+      starting = false;
+    }
+  }
+
   return {
-    async start() {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          // Keep Chrome's voice pipeline ON — its auto-gain is what brings the
-          // mic up to a usable level (disabling it gave near-silent audio).
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        });
-        ctx = new AudioContext();
-        const resume = () => { if (ctx && ctx.state === "suspended") ctx.resume(); };
-        document.addEventListener("click", resume);
-        document.addEventListener("keydown", resume);
-        await ctx.resume().catch(() => {});
-
-        // Record the RAW mic stream directly (the standard pattern). The
-        // analyser is only a passive level tap for VAD — it never sits in the
-        // recording path, so it can't corrupt the audio. The server peak-
-        // normalizes, so exact capture level isn't critical.
-        const src = ctx.createMediaStreamSource(stream);
-        analyser = ctx.createAnalyser();
-        analyser.fftSize = 1024;
-        buf = new Float32Array(analyser.fftSize);
-        src.connect(analyser);
-
-        recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-        recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) parts.push(e.data); };
-        recorder.onstop = () => {
-          const keep = (recorder as any)._keep;
-          const blob = new Blob(parts, { type: mime || "audio/webm" });
-          parts = [];
-          if (keep && blob.size > 0) blob.arrayBuffer().then(onUtterance);
-        };
-
-        timer = window.setTimeout(poll, POLL_MS);
-        console.log("[capture] started; mime=", mime, "ctx.sampleRate=", ctx.sampleRate);
-      } catch (e: any) {
-        onError(
-          e && e.name === "NotAllowedError"
-            ? "Microphone access denied. Please allow microphone access."
-            : "Could not start the microphone."
-        );
-      }
-    },
+    start: startCapture,
     pause() {
       paused = true;
       if (recording) endUtterance(false); // discard whatever was mid-capture
@@ -150,9 +164,15 @@ export function createAudioCapture(
     resume() {
       paused = false;
       silenceSince = 0;
+      // Self-heal: if the mic pipeline was never started (the post-briefing
+      // start branch was missed) or was torn down, bring it up now. Without
+      // this, entering idle/listening just flips a flag on a dead pipeline and
+      // Marion silently never hears you.
+      if (!started) void startCapture();
     },
     stop() {
       paused = true;
+      started = false;
       if (timer) { clearTimeout(timer); timer = null; }
       try { if (recorder && recorder.state !== "inactive") recorder.stop(); } catch {}
       try { stream?.getTracks().forEach((t) => t.stop()); } catch {}

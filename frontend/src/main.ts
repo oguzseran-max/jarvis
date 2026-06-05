@@ -6,12 +6,19 @@
  */
 
 import { createOrb, type OrbState } from "./orb";
+import { createMarion } from "./marion";
+import { createMarionStream, type MarionStream } from "./did_stream";
+import { createBuildHud } from "./build_hud";
+import { createWeather } from "./weather";
+import { createBoot } from "./boot";
+import { createCornerHud } from "./hud";
 import { createAudioPlayer } from "./voice";
 import { createAudioCapture } from "./audio_capture";
 import { createSocket } from "./ws";
 import { captureCameraFrame } from "./camera";
 import { openSettings, checkFirstTimeSetup } from "./settings";
 import "./style.css";
+
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -21,7 +28,11 @@ type State = "idle" | "listening" | "thinking" | "speaking";
 let currentState: State = "idle";
 let isMuted = false;
 let bootActive = true; // during the startup boot video — suppress greeting + mic
-let currentLang = "en"; // active language (drives boot audio + recognition)
+let currentLang = "fr"; // active language (drives boot audio + recognition)
+let currentLook = "default"; // weather-dependent outfit: "default" | "rain" | "sun"
+const LOOK_IMG: Record<string, string> = {
+  default: "/marion-cutout.png", rain: "/marion-rain.png", sun: "/marion-sun.png",
+};
 let awaitingBriefing = false; // mic stays off until the post-boot briefing finishes
 
 const statusEl = document.getElementById("status-text")!;
@@ -51,18 +62,125 @@ function updateStatus(state: State) {
 
 const canvas = document.getElementById("orb-canvas") as HTMLCanvasElement;
 const orb = createOrb(canvas);
+// Marion — the FR/TR personas get a real face instead of the orb. The face
+// reacts to the same TTS audio as the orb (wired below). Hidden by default
+// (English starts on the orb); setLanguage() flips between face and orb.
+const marion = createMarion("/marion-cutout.png");
+// Languages that show Marion's face rather than the orb.
+const FACE_LANGS = new Set(["fr", "tr"]);
+const cornerHud = createCornerHud(); // persistent 4-corner monitoring panels
+const buildHud = createBuildHud(); // middle-right progress panel for background builds
+
+// Live gate camera (DoorBird) — small panel bottom-left, next to DIAGNOSTICS.
+// The MJPEG stream is proxied by the backend (creds stay server-side).
+(function gateCam() {
+  const C = "76, 168, 232";
+  const style = document.createElement("style");
+  style.textContent = `
+    #gate-cam { position: fixed; bottom: 22px; left: 250px; z-index: 4; width: 250px;
+      border: 1px solid rgba(${C},0.35); border-radius: 8px; overflow: hidden;
+      background: #05070c; box-shadow: 0 0 18px rgba(${C},0.15); pointer-events: none;
+      font-family: ui-monospace, Menlo, monospace; }
+    #gate-cam .gc-head { font-size: 9px; letter-spacing: 1.5px; color: rgba(${C},0.9);
+      padding: 3px 8px; text-transform: uppercase; display: flex; align-items: center; gap: 6px;
+      border-bottom: 1px solid rgba(${C},0.2); }
+    #gate-cam .gc-dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e;
+      box-shadow: 0 0 6px #22c55e; animation: gcblink 2s ease-in-out infinite; }
+    @keyframes gcblink { 50% { opacity: .3; } }
+    /* Landscape strip — fixed height so it lines up with the DIAGNOSTICS panel. */
+    #gate-cam img { display: block; width: 100%; height: 92px; object-fit: cover; background:#05070c; }
+  `;
+  document.head.appendChild(style);
+  const box = document.createElement("div");
+  box.id = "gate-cam";
+  box.innerHTML = `<div class="gc-head"><span class="gc-dot"></span>PORTAIL · LIVE</div>`;
+  const img = document.createElement("img");
+  img.alt = "Portail";
+  img.src = "/api/doorbird/video";
+  img.onerror = () => { box.style.display = "none"; };  // hide if DoorBird unavailable
+  box.appendChild(img);
+  document.body.appendChild(box);
+})();
+
+// Weather effects: rain/sun screen FX + Marion's outfit follows the weather
+// (umbrella photo when raining, bikini when sunny). The talking-video portrait
+// updates too (restart the stream so D-ID uses the new look).
+const weather = createWeather((look) => {
+  currentLook = look;
+  marion.setImage(LOOK_IMG[look] || LOOK_IMG.default);
+  // Re-create the talking stream with the new outfit. Also restart when it's
+  // still CONNECTING (`starting`) — at boot the stream pre-connects with
+  // "default" before the weather is known, so without this the live video would
+  // stay on the default look even once the weather resolves to rain/sun.
+  if (marionStream.active || marionStream.starting) marionStream.restart();
+});
+// NB: weather.start() is called *after* marionStream is declared below — with a
+// preview hash (#rain/#clear) it fires onLook synchronously, which touches
+// marionStream; calling it here would hit a temporal-dead-zone ReferenceError.
 
 const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
 const WS_URL = `${wsProto}//${window.location.host}/ws/voice`;
 const socket = createSocket(WS_URL);
+// Re-assert the active language on every (re)connection so a backend restart /
+// dropped socket never leaves the server on unreliable language auto-detect
+// (which made Marion answer in English).
+socket.onOpen(() => socket.send({ type: "set_lang", lang: currentLang }));
 
 const audioPlayer = createAudioPlayer();
 orb.setAnalyser(audioPlayer.getAnalyser());
+marion.setAnalyser(audioPlayer.getAnalyser());
+
+// Marion live avatar (D-ID WebRTC). Started when the user switches to FR/TR,
+// stopped on English. The incoming video track is rendered in Marion's frame;
+// speaking start/end events drive the listening/speaking state machine.
+const marionStream: MarionStream = createMarionStream({
+  socket,
+  onTrack: (stream) => marion.showLiveStream(stream, isMuted),
+  onSpeakingStart: () => { transition("speaking"); armSpeakSafety(20000); },
+  onSpeakingEnd: () => { clearSpeakSafety(); finishSpeaking(); },
+  onClosed: () => {
+    marion.hideLiveStream();
+    // D-ID idles a stream out after a few quiet minutes. If we're still on a
+    // face persona, transparently reopen it so the next reply lip-syncs.
+    if (FACE_LANGS.has(currentLang)) setTimeout(() => marionStream.start(), 3000);
+  },
+  getLook: () => currentLook,  // weather-appropriate portrait for the talking video
+});
+
+weather.start();  // now safe: marionStream exists, so onLook won't hit a TDZ
+
+// Safety net for the live-stream "speaking" state: D-ID's data-channel "done"
+// event is not 100% reliable, and if it's missed we'd stay in "speaking" with
+// the mic paused forever ("she stopped listening"). Arm a fallback that forces
+// us back to idle so the mic always resumes.
+let speakSafety: ReturnType<typeof setTimeout> | undefined;
+function armSpeakSafety(ms: number) {
+  if (speakSafety) clearTimeout(speakSafety);
+  speakSafety = setTimeout(() => { speakSafety = undefined; finishSpeaking(); }, ms);
+}
+function clearSpeakSafety() {
+  if (speakSafety) { clearTimeout(speakSafety); speakSafety = undefined; }
+}
+// Called when Marion finishes speaking over the live stream (no base64 audio, so
+// audioPlayer.onFinished never fires). Mirrors that handler: after the post-boot
+// briefing, START the mic; otherwise just return to idle.
+function finishSpeaking() {
+  if (awaitingBriefing) {
+    awaitingBriefing = false;
+    voiceInput.start();
+    transition("listening");
+  } else {
+    transition("idle");
+  }
+}
 
 function transition(newState: State) {
   if (newState === currentState) return;
+  if (newState !== "speaking") clearSpeakSafety();
   currentState = newState;
   orb.setState(newState as OrbState);
+  marion.setState(newState as OrbState);
+  cornerHud.setState(newState as OrbState);
   updateStatus(newState);
 
   switch (newState) {
@@ -137,6 +255,33 @@ socket.onMessage((msg) => {
     }
     // Log text for debugging
     if (msg.text) console.log("[JARVIS]", msg.text);
+  } else if (type === "avatar_stream_speak") {
+    // Marion is about to speak over the live WebRTC stream. Pause the mic and
+    // show speaking state now; the stream's "done" event returns us to idle.
+    if (bootActive) return;
+    if (msg.text) console.log("[JARVIS]", msg.text);
+    audioPlayer.stop();
+    if (currentState !== "speaking") transition("speaking");
+    // Resume the mic exactly when she finishes: D-ID gives us the audio duration,
+    // so we don't depend on its flaky "done" event. (+buffer for setup latency.)
+    const durSec = typeof msg.duration === "number"
+      ? msg.duration
+      : ((msg.text as string | undefined)?.length ?? 80) * 0.09 + 4;
+    armSpeakSafety(Math.round((durSec + 3) * 1000));
+  } else if (type === "avatar_video") {
+    // Phase 2 — a D-ID lip-sync video of Marion (FR/TR). The mp4 carries her
+    // voice, so we play the video instead of the base64 audio and drive the
+    // return-to-idle off the video's end rather than audioPlayer.onFinished.
+    if (bootActive) return;
+    const url = msg.url as string;
+    if (msg.text) console.log("[JARVIS]", msg.text);
+    if (url) {
+      audioPlayer.stop(); // no overlapping Fish audio
+      if (currentState !== "speaking") transition("speaking");
+      marion.playVideo(url, isMuted).then(() => transition("idle"));
+    } else {
+      transition("idle");
+    }
   } else if (type === "status") {
     const state = msg.state as string;
     if (state === "thinking" && currentState !== "thinking") {
@@ -166,9 +311,19 @@ socket.onMessage((msg) => {
         socket.send({ type: "camera_frame", request_id: requestId, data: null });
       });
   } else if (type === "task_spawned") {
+    const label = ((msg.prompt as string) || "Construction").split("\n")[0].trim().slice(0, 42);
+    buildHud.spawned(msg.task_id as string, label);
     console.log("[task]", "spawned:", msg.task_id, msg.prompt);
   } else if (type === "task_complete") {
+    buildHud.completed(msg.task_id as string, msg.status as string, msg.summary as string | undefined);
     console.log("[task]", "complete:", msg.task_id, msg.status, msg.summary);
+  } else if (type === "play_music") {
+    // Voice command ("lance la musique" / "go to hell") — restart the music, loud.
+    replayBootMusic();
+  } else if (type === "stop_music") {
+    // Voice command ("coupe la musique") — fade the music out, then pause it.
+    fadeMusicTo(0, 800);
+    setTimeout(() => { try { bootMusic.pause(); } catch {} }, 900);
   }
 });
 
@@ -176,33 +331,89 @@ socket.onMessage((msg) => {
 // Kick off
 // ---------------------------------------------------------------------------
 
-// ── Boot sequence: machine sound + HUD loading video, then fade to the orb ──
+// ── Boot sequence: cinematic real-time HUD (boot.ts) driven by the boot audio ──
+// Two tracks: bootMusic loops forever (the 28s music bed; it drives the HUD
+// clock and never stops — it just fades to a faint ambient level once the orb
+// takes over), and bootAudio plays the one-shot voice line over the top.
 const bootOverlay = document.getElementById("boot-overlay")!;
-const bootVideo = document.getElementById("boot-video") as HTMLVideoElement;
 const bootHint = document.getElementById("boot-hint")!;
-const bootLoading = document.getElementById("boot-loading")!;
+const bootMusic = document.getElementById("boot-music") as HTMLAudioElement;
 const bootAudio = document.getElementById("boot-audio") as HTMLAudioElement;
+const boot = createBoot(bootOverlay);
 let bootStarted = false;
-let bootGraphicFading = false;
+let bootFaded = false;
 
-bootVideo.addEventListener("timeupdate", () => {
+// Climax cue — the HUD burst is aligned to a musical hit detected offline
+// (tools/boot_build/analyze_beats.py → boot_cue.json). Defaults keep the boot
+// working even if the cue file is missing.
+const CUE = { burst: 19, handoff: 22.5, end: 28 };
+fetch("/boot_cue.json")
+  .then((r) => (r.ok ? r.json() : null))
+  .then((c) => {
+    if (c && typeof c.burst === "number") {
+      CUE.burst = c.burst;
+      CUE.handoff = c.handoff ?? c.burst + 3.3;
+      CUE.end = c.end ?? c.burst + 8.5;
+      boot.setCue(CUE.burst, CUE.handoff);
+    }
+  })
+  .catch(() => {});
+
+// Music levels: present during the boot, faint (audible but unobtrusive) once
+// the orb is live. The music keeps looping underneath at the ambient level.
+const BOOT_MUSIC_VOL = 0.9;
+const AMBIENT_MUSIC_VOL = 0.08;
+
+// Smoothly ramp the looping music volume (never pauses it).
+let musicFadeRaf = 0;
+function fadeMusicTo(target: number, ms: number) {
+  cancelAnimationFrame(musicFadeRaf);
+  const start = bootMusic.volume;
+  const t0 = performance.now();
+  const step = () => {
+    const k = Math.min(1, (performance.now() - t0) / ms);
+    bootMusic.volume = start + (target - start) * k;
+    if (k < 1) musicFadeRaf = requestAnimationFrame(step);
+  };
+  musicFadeRaf = requestAnimationFrame(step);
+}
+
+// The boot track is time-of-day aware: a morning coffee line, an evening wine
+// line (voice-over only — no on-screen captions). Morning runs 05:00–17:59.
+function timeOfDay(): "morning" | "evening" {
+  const h = new Date().getHours();
+  return h >= 5 && h < 18 ? "morning" : "evening";
+}
+
+bootMusic.addEventListener("timeupdate", () => {
   if (!bootActive) return;
-  // When the red HUD fades to black (~18.6s), reveal the red loading graphic.
-  if (bootVideo.currentTime >= 18.6) bootLoading.classList.add("show");
-  // Near the end (~bar 95%), fade the graphic out so the orb emerges as the
-  // music fades — the video keeps playing underneath so the audio fade finishes.
-  if (!bootGraphicFading && bootVideo.currentTime >= 26.8) {
-    bootGraphicFading = true;
+  boot.setTime(bootMusic.currentTime);
+  // Near the end of the first pass, bloom the HUD out so the orb shows through
+  // and drop the music to the faint ambient level — without ever stopping it.
+  if (!bootFaded && bootMusic.currentTime >= CUE.handoff) {
+    bootFaded = true;
+    // Crossfade, not a cut: ignite the orb so it blooms in underneath while the
+    // boot's particles dissolve and the overlay eases away — and drop the music
+    // to the faint ambient level.
+    orb.ignite();
+    cornerHud.reveal();
     bootOverlay.classList.add("done");
+    fadeMusicTo(AMBIENT_MUSIC_VOL, 2500);
   }
 });
 
 function endBoot() {
   if (!bootActive) return;
   bootActive = false;
-  try { bootVideo.pause(); bootAudio.pause(); } catch {}
+  // Stop the one-shot voice, but leave the music looping — just drop it to the
+  // faint ambient level so it stays present under the orb without disturbing.
+  try { bootAudio.pause(); } catch {}
+  fadeMusicTo(AMBIENT_MUSIC_VOL, 2500);
+  if (!bootFaded) { bootFaded = true; orb.ignite(); } // ignite if we never crossfaded
+  cornerHud.reveal();
+  boot.fadeOut();
   bootOverlay.classList.add("done");
-  setTimeout(() => { bootOverlay.style.display = "none"; }, 1500);
+  setTimeout(() => { boot.dispose(); bootOverlay.style.display = "none"; }, 1500);
   // Deliver the briefing with the mic OFF so JARVIS can't hear (and transcribe)
   // its own voice. The mic starts only when the briefing finishes (onFinished).
   awaitingBriefing = true;
@@ -220,30 +431,74 @@ function endBoot() {
   }, 180000);
 }
 
+// Route the boot music + voice into the orb's analyser so the orb visibly
+// pulses with the music (during the boot and the faint ambient loop) and with
+// JARVIS's voice. The orb already reads this analyser (it's the TTS player's).
+// MediaElementSource can be created only once per element, so guard it.
+let bootAudioRouted = false;
+function routeBootAudioToOrb() {
+  if (bootAudioRouted) return;
+  try {
+    const an = audioPlayer.getAnalyser();
+    const ctx = an.context as AudioContext;
+    ctx.createMediaElementSource(bootMusic).connect(an);
+    ctx.createMediaElementSource(bootAudio).connect(an);
+    bootAudioRouted = true;
+  } catch (e) {
+    console.warn("[boot] could not route audio to the orb analyser", e);
+  }
+}
+
+// "Let's go to hell" — replay the music from the top, loud, with a quick fade-in
+// (no loop: it plays through once, then stays finished until asked again).
+const REPLAY_MUSIC_VOL = 0.85;
+function replayBootMusic() {
+  if (!bootMusic.src) bootMusic.src = `/boot_music.mp3`;
+  routeBootAudioToOrb();
+  bootMusic.loop = false;
+  bootMusic.currentTime = 0;
+  bootMusic.muted = isMuted;
+  bootMusic.volume = 0.0;
+  bootMusic.play().then(() => fadeMusicTo(REPLAY_MUSIC_VOL, 1200)).catch(() => {});
+}
+
 function startBoot() {
   if (bootStarted) return;
   bootStarted = true;
   bootHint.style.display = "none";
-  // Silent HUD video + the active language's audio track (machine sound +
-  // music + welcome line in EN/FR/TR), started together by this user gesture.
-  bootVideo.muted = true;
-  bootVideo.currentTime = 0;
-  bootAudio.src = `/boot_audio_${currentLang}.mp3`;
+  // Two tracks, started together by this user gesture:
+  //  • bootMusic — the looping music bed; it drives the HUD clock and keeps
+  //    playing forever (faded to ambient at the handoff).
+  //  • bootAudio — the one-shot, time-of-day welcome line (morning coffee /
+  //    evening wine), louder than the music so it sits clearly on top.
+  const tod = timeOfDay();
+  bootMusic.src = `/boot_music.mp3`;
+  // No loop: once the track finishes it stays finished and is NOT reloaded —
+  // until the user says the trigger phrase (server → {type:"play_music"}).
+  bootMusic.loop = false;
+  bootMusic.currentTime = 0;
+  bootMusic.volume = BOOT_MUSIC_VOL;
+  bootMusic.muted = isMuted;
+  bootAudio.src = `/boot_voice_${currentLang}_${tod}.mp3`;
   bootAudio.currentTime = 0;
-  bootVideo.play().catch(() => {});
-  bootAudio.play().catch(() => endBoot());
+  bootAudio.volume = 1.0;
+  routeBootAudioToOrb(); // so the orb pulses with the music + voice
+  boot.begin();
+  bootMusic.play().catch(() => endBoot());
+  bootAudio.play().catch(() => {});
+  // The music loops (never "ends"), so hand off on a timer once the first pass
+  // is done — the HUD has bloomed into the orb by then. Tied to the climax cue.
+  setTimeout(endBoot, CUE.end * 1000);
   // Prefetch the briefing NOW (during the ~28s boot) so it's ready instantly
   // when the boot ends — no second wait.
   socket.send({ type: "set_lang", lang: currentLang });
   socket.send({ type: "briefing_prefetch" });
+  // Pre-connect Marion's live stream during the boot if she's the active
+  // persona, so the ~2-3s WebRTC handshake is hidden behind the boot screen
+  // and she's already online (warmed up) the instant the boot ends.
+  if (FACE_LANGS.has(currentLang)) marionStream.start();
 }
 
-bootVideo.addEventListener("ended", endBoot);
-bootAudio.addEventListener("ended", endBoot);
-// Safety net: end the boot even if the video stalls.
-bootVideo.addEventListener("loadedmetadata", () => {
-  setTimeout(endBoot, (bootVideo.duration + 4) * 1000);
-});
 // Boot needs a user gesture (audio autoplay). Start it on the first click.
 document.addEventListener("click", startBoot);
 
@@ -267,6 +522,14 @@ ensureAudioContext();
 
 const btnMute = document.getElementById("btn-mute")!;
 const btnMenu = document.getElementById("btn-menu")!;
+
+// Avatar button — opens the interactive avatar app (separate project on :5174)
+// in a new tab, without leaving the orb.
+const btnAvatar = document.getElementById("btn-avatar");
+btnAvatar?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  window.open(`${location.protocol}//${location.hostname}:5174`, "_blank");
+});
 const menuDropdown = document.getElementById("menu-dropdown")!;
 const btnRestart = document.getElementById("btn-restart")!;
 const btnFixSelf = document.getElementById("btn-fix-self")!;
@@ -277,6 +540,19 @@ function setLanguage(lang: string) {
   currentLang = lang;
   for (const b of langButtons) b.classList.toggle("active", b.dataset.lang === lang);
   socket.send({ type: "set_lang", lang });
+  // FR/TR personas show Marion's face; English stays on the orb. Hide the orb
+  // canvas when the face is up so only one visualization is ever visible.
+  const showFace = FACE_LANGS.has(lang);
+  marion.setVisible(showFace);
+  // Keep the orb rendering; .marion-mode shrinks it into a core behind Marion.
+  document.body.classList.toggle("marion-mode", showFace);
+  canvas.style.visibility = "visible";
+  // In Marion mode, dim the orb's bright core while she speaks so it doesn't
+  // wash her out (she's screen-blended in front of it).
+  orb.setDimOnSpeak(showFace);
+  // Open/close the live D-ID stream to match the persona.
+  if (showFace) marionStream.start();
+  else marionStream.stop();
   console.log("[lang] set to", lang);
 }
 for (const b of langButtons) {
@@ -285,13 +561,15 @@ for (const b of langButtons) {
     setLanguage(b.dataset.lang || "en");
   });
 }
-// Tell the server the default (English) once connected.
-setTimeout(() => setLanguage("en"), 1500);
+// Tell the server the default (French — Marion) once connected.
+setTimeout(() => setLanguage("fr"), 1500);
 
 btnMute.addEventListener("click", (e) => {
   e.stopPropagation();
   isMuted = !isMuted;
   btnMute.classList.toggle("muted", isMuted);
+  bootMusic.muted = isMuted; // also silence the looping ambient music
+  marion.setMuted(isMuted);  // and Marion's live video audio
   if (isMuted) {
     voiceInput.pause();
     transition("idle");
@@ -343,3 +621,15 @@ btnSettings.addEventListener("click", (e) => {
 setTimeout(() => {
   checkFirstTimeSetup();
 }, 2000);
+
+// ── FX preview: open .../#rain, #storm, #clear or #clouds to jump STRAIGHT to the
+//    live UI (Marion + the weather effect), skipping the ~28s cinematic boot. ──
+if (["rain", "storm", "clear", "clouds"].includes(decodeURIComponent(location.hash.replace("#", "")).trim())) {
+  bootStarted = true;        // block the real boot from a stray click
+  bootActive = false;
+  bootOverlay.style.display = "none";
+  orb.ignite();
+  cornerHud.reveal();
+  setLanguage("fr");         // show Marion (with her weather accessory)
+  // weather.start() (above) reads the hash and stages the effect.
+}

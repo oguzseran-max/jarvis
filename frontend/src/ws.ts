@@ -8,6 +8,9 @@ export interface JarvisSocket {
   send(data: Record<string, unknown>): void;
   sendBinary(data: ArrayBuffer): void;
   onMessage(handler: MessageHandler): void;
+  /** Called on every (re)connection — used to re-assert the forced language so
+   *  the backend never falls back to unreliable auto-detect after a reconnect. */
+  onOpen(handler: () => void): void;
   close(): void;
   isConnected(): boolean;
 }
@@ -15,6 +18,7 @@ export interface JarvisSocket {
 export function createSocket(url: string): JarvisSocket {
   let ws: WebSocket | null = null;
   let handlers: MessageHandler[] = [];
+  let openHandlers: (() => void)[] = [];
   let reconnectDelay = 1000;
   let closed = false;
   let connected = false;
@@ -28,6 +32,9 @@ export function createSocket(url: string): JarvisSocket {
       connected = true;
       reconnectDelay = 1000;
       console.log("[ws] connected");
+      for (const h of openHandlers) {
+        try { h(); } catch {}
+      }
     };
 
     ws.onmessage = (event) => {
@@ -69,6 +76,10 @@ export function createSocket(url: string): JarvisSocket {
     },
     onMessage(handler) {
       handlers.push(handler);
+    },
+    onOpen(handler) {
+      openHandlers.push(handler);
+      if (connected) handler();
     },
     close() {
       closed = true;

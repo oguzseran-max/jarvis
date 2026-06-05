@@ -6,7 +6,9 @@ set -u
 JARVIS_DIR="/Users/oguz/jarvis"
 BACKEND_PORT=8340
 FRONTEND_PORT=5173
-URL="http://localhost:${FRONTEND_PORT}/"
+# Open the STABLE production URL (backend-served build, trusted cert, no vite HMR
+# → no mid-build page reloads). The :5173 dev server still starts for development.
+URL="https://localhost:${BACKEND_PORT}/"
 LOG_DIR="${JARVIS_DIR}/.run"
 mkdir -p "$LOG_DIR"
 
@@ -43,15 +45,31 @@ else
       >"$LOG_DIR/frontend.log" 2>&1 & )
 fi
 
-# Wait (bounded) for the frontend to accept connections, then open Chrome once.
+# Wait (bounded) for the backend (which serves the app on :8340) to accept
+# connections, then open Chrome once.
 for _ in $(seq 1 30); do
-  port_up "$FRONTEND_PORT" && break
+  port_up "$BACKEND_PORT" && break
   sleep 0.5
 done
 
-if port_up "$FRONTEND_PORT"; then
-  open -a "Google Chrome" "$URL"
-  echo "[jarvis] opened $URL in Chrome"
+if port_up "$BACKEND_PORT"; then
+  # Don't pile up tabs: this script runs on every Claude session start, so only
+  # open Chrome if no JARVIS tab is already there. If one exists, just focus it.
+  already=$(osascript -e 'tell application "Google Chrome"
+    set found to false
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (URL of t) contains "localhost:8340" then set found to true
+      end repeat
+    end repeat
+    return found
+  end tell' 2>/dev/null)
+  if [ "$already" = "true" ]; then
+    echo "[jarvis] JARVIS tab already open — not opening another"
+  else
+    open -a "Google Chrome" "$URL"
+    echo "[jarvis] opened $URL in Chrome"
+  fi
 else
-  echo "[jarvis] frontend did not come up in time; not opening browser" >&2
+  echo "[jarvis] backend did not come up in time; not opening browser" >&2
 fi

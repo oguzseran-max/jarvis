@@ -19,6 +19,7 @@ import os
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import numpy as np
@@ -32,7 +33,59 @@ ALLOWED = {l.strip() for l in os.getenv("WHISPER_LANGS", "en,fr,tr").split(",") 
 print(f"[whisper] loading model '{MODEL_SIZE}' …", flush=True)
 model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
 _lock = threading.Lock()  # faster-whisper isn't meant for concurrent calls
+
+# Per-language decoder primers — short, in-domain vocabulary that nudges Whisper
+# toward the household's proper nouns and habits (kept brief to avoid the model
+# echoing these words into silence). English left unprimed.
+_PRIMERS = {
+    "fr": ("Conversation familière en français avec Marion. "
+           "mon amour, Leyla, Aylin, Spotify, Phil Collins, la musique, "
+           "le salon, la mezzanine, la cuisine, le portail, les lumières, la météo."),
+    "tr": "Türkçe sohbet. Marion, müzik, Spotify, ışıklar, kapı, hava durumu.",
+}
+
+# self_eval.py writes learned proper nouns here; we merge them into the primer
+# live (re-read only when the file changes), so Marion stops mis-hearing words
+# the user has corrected — without restarting this service.
+_VOCAB_DIR = Path(__file__).resolve().parent / "data"
+_vocab_cache: dict = {}  # lang -> (mtime, "word, word, ...")
+
+
+def _primer_for(lang):
+    base = _PRIMERS.get(lang)
+    if not lang:
+        return base
+    try:
+        path = _VOCAB_DIR / f"whisper_vocab_{lang}.txt"
+        mtime = path.stat().st_mtime
+        cached = _vocab_cache.get(lang)
+        if not cached or cached[0] != mtime:
+            learned = path.read_text().strip()
+            _vocab_cache[lang] = (mtime, learned)
+        else:
+            learned = cached[1]
+    except Exception:
+        learned = ""
+    if learned:
+        return f"{base or ''} {learned}".strip()
+    return base
 print(f"[whisper] ready on :{PORT}  langs={sorted(ALLOWED)}", flush=True)
+
+# Whisper hallucinates these training-data artifacts on silence/noise/music —
+# discard any transcript that's essentially one of them so JARVIS never "replies"
+# to a subtitle credit it imagined.
+_HALLUCINATIONS = (
+    "amara.org", "soustitreur", "sous-titres réalisés", "sous-titrage",
+    "merci d'avoir regardé", "merci d’avoir regardé", "thanks for watching",
+    "thank you for watching", "abonnez-vous", "subscribe", "♪",
+)
+
+
+def _is_hallucination(text: str) -> bool:
+    t = text.lower().strip()
+    if not t:
+        return False
+    return any(h in t for h in _HALLUCINATIONS)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -72,28 +125,44 @@ class Handler(BaseHTTPRequestHandler):
                 d.write(raw)
             print(f"[whisper] dump: {len(raw)} bytes -> /tmp/whisper_last.webm", flush=True)
         try:
-            # Decode to 16 kHz mono float, then peak-normalize — the browser mic
-            # level is unpredictable, so we level it here for reliable recognition.
+            # Decode to 16 kHz mono float. The browser mic level is unpredictable,
+            # so we level it — BUT capping the gain: blasting a near-silent clip to
+            # full scale just amplifies noise/music and makes Whisper hallucinate.
             audio = decode_audio(path, sampling_rate=16000)
             peak = float(np.abs(audio).max()) if audio.size else 0.0
-            if peak > 1e-4:
-                audio = audio * (0.95 / peak)
             if os.getenv("WHISPER_DEBUG_DUMP"):
                 print(f"[whisper] decoded {audio.size/16000:.2f}s peak={peak:.4f}", flush=True)
-            with _lock:
-                segments, info = model.transcribe(
-                    audio, language=forced, beam_size=5,
-                    vad_filter=True,
-                    no_speech_threshold=0.6,
-                    condition_on_previous_text=False,
-                )
-                text = " ".join(s.text.strip() for s in segments).strip()
-            lang = forced or (info.language if info.language in ALLOWED else "en")
+            text = ""
+            lang = forced or "en"
+            # Too quiet → it's silence/ambient, not speech. Don't amplify, skip it.
+            if peak >= 0.02:
+                audio = audio * min(0.95 / peak, 10.0)
+                with _lock:
+                    segments, info = model.transcribe(
+                        audio, language=forced, beam_size=5,
+                        vad_filter=True,
+                        no_speech_threshold=0.6,
+                        compression_ratio_threshold=2.2,
+                        condition_on_previous_text=False,
+                        # Prime the decoder with in-domain French/Turkish words so
+                        # proper nouns and household vocabulary are recognised
+                        # correctly (costs ~nothing, improves accuracy). Includes
+                        # words self_eval has learned from the user's corrections.
+                        initial_prompt=_primer_for(forced),
+                    )
+                    text = " ".join(s.text.strip() for s in segments).strip()
+                lang = forced or (info.language if info.language in ALLOWED else "en")
+                if _is_hallucination(text):
+                    text = ""
+                prob = round(float(info.language_probability), 3)
+                detected = info.language
+            else:
+                prob, detected = 0.0, "silence"
             self._json(200, {
                 "text": text,
                 "language": lang,
-                "probability": round(float(info.language_probability), 3),
-                "detected": info.language,
+                "probability": prob,
+                "detected": detected,
             })
         except Exception as exc:  # never crash the loop on a bad clip
             self._json(500, {"error": str(exc)})

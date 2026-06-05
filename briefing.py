@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -43,34 +44,64 @@ def _get(url: str, timeout: float = 15.0) -> bytes:
 
 # ---- Traffic -------------------------------------------------------------
 
-async def get_traffic() -> dict:
-    """Live traffic-aware ETA home → office via Google Directions."""
+async def _google_routes_traffic() -> dict:
+    """Live traffic-aware ETA home → office via the Google Routes API.
+
+    The legacy Directions API is deprecated for new keys; Routes API
+    (routes.googleapis.com/.../v2:computeRoutes) is the current endpoint. Enable
+    "Routes API" for the key in Google Cloud Console.
+    """
     key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
     if not key:
         return {"ok": False, "reason": "no_key"}
 
     def _call():
-        params = {
-            "origin": HOME_ADDRESS, "destination": OFFICE_ADDRESS,
-            "departure_time": "now", "traffic_model": "best_guess",
-            "mode": "driving", "key": key,
-        }
-        url = "https://maps.googleapis.com/maps/api/directions/json?" + urllib.parse.urlencode(params)
-        return json.loads(_get(url))
+        body = json.dumps({
+            "origin": {"address": HOME_ADDRESS},
+            "destination": {"address": OFFICE_ADDRESS},
+            "travelMode": "DRIVE",
+            "routingPreference": "TRAFFIC_AWARE",
+        }).encode()
+        req = urllib.request.Request(
+            "https://routes.googleapis.com/directions/v2:computeRoutes",
+            data=body, method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": key,
+                "X-Goog-FieldMask": "routes.duration,routes.staticDuration,routes.distanceMeters",
+            },
+        )
+        return json.loads(urllib.request.urlopen(req, timeout=15).read())
 
     try:
         data = await asyncio.to_thread(_call)
+    except urllib.error.HTTPError as e:
+        msg = ""
+        try:
+            msg = e.read().decode(errors="ignore")[:300]
+        except Exception:
+            pass
+        log.warning(f"traffic fetch failed: {e} {msg}")
+        return {"ok": False, "reason": msg or str(e)}
     except Exception as e:
         log.warning(f"traffic fetch failed: {e}")
         return {"ok": False, "reason": str(e)}
 
-    if data.get("status") != "OK":
-        return {"ok": False, "reason": data.get("error_message") or data.get("status")}
+    routes = data.get("routes") or []
+    if not routes:
+        return {"ok": False, "reason": "no_route"}
+    r0 = routes[0]
 
-    leg = data["routes"][0]["legs"][0]
-    normal = leg["duration"]["value"] // 60
-    traffic = leg.get("duration_in_traffic", {}).get("value", leg["duration"]["value"]) // 60
-    delay = traffic - normal
+    def _secs(v) -> int:
+        try:
+            return int(str(v).rstrip("s"))
+        except Exception:
+            return 0
+
+    traffic_min = _secs(r0.get("duration")) // 60
+    normal_min = _secs(r0.get("staticDuration") or r0.get("duration")) // 60
+    delay = traffic_min - normal_min
+    meters = r0.get("distanceMeters", 0)
     if delay >= 8:
         condition = "heavy traffic"
     elif delay >= 3:
@@ -79,14 +110,95 @@ async def get_traffic() -> dict:
         condition = "clear roads"
     return {
         "ok": True,
-        "distance": leg["distance"]["text"],
-        "eta_min": traffic,
-        "normal_min": normal,
+        "distance": f"{meters / 1000:.1f} km",
+        "eta_min": traffic_min,
+        "normal_min": normal_min,
         "delay_min": delay,
         "condition": condition,
-        "route": data["routes"][0].get("summary", ""),
-        "warnings": data["routes"][0].get("warnings", []),
+        "route": "the usual route",
+        "warnings": [],
     }
+
+
+# Keyless fallback: OpenStreetMap (Nominatim geocoding) + OSRM routing. No live
+# traffic, but a working ETA when the Google key/Routes-API isn't available.
+_GEO_CACHE: dict[str, tuple] = {}
+
+
+def _geocode_sync(addr: str):
+    if addr in _GEO_CACHE:
+        return _GEO_CACHE[addr]
+    # Nominatim resolves streets better than business names. Try the full string,
+    # then drop a leading business-name segment, then just the street tail.
+    parts = [p.strip() for p in addr.split(",") if p.strip()]
+    variants = [addr]
+    if len(parts) > 2:
+        variants.append(", ".join(parts[1:]))    # drop leading business name
+        variants.append(", ".join(parts[-3:]))   # street + city + country
+    for q in variants:
+        try:
+            url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+                {"q": q, "format": "json", "limit": 1})
+            req = urllib.request.Request(url, headers={"User-Agent": "JARVIS-briefing/1.0 (personal use)"})
+            data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            if data:
+                coords = (float(data[0]["lat"]), float(data[0]["lon"]))
+                _GEO_CACHE[addr] = coords
+                return coords
+        except Exception:
+            continue
+    return None
+
+
+def _osrm_sync(o: tuple, d: tuple):
+    # OSRM expects lon,lat order
+    url = (f"https://router.project-osrm.org/route/v1/driving/"
+           f"{o[1]},{o[0]};{d[1]},{d[0]}?overview=false")
+    data = json.loads(_get(url))
+    if data.get("code") != "Ok" or not data.get("routes"):
+        return None
+    r = data["routes"][0]
+    return r["duration"], r["distance"]  # seconds, meters
+
+
+async def _osrm_fallback() -> dict:
+    loop = asyncio.get_event_loop()
+    try:
+        home = await loop.run_in_executor(None, _geocode_sync, HOME_ADDRESS)
+        office = await loop.run_in_executor(None, _geocode_sync, OFFICE_ADDRESS)
+        if not home or not office:
+            return {"ok": False, "reason": "geocode_failed"}
+        res = await loop.run_in_executor(None, _osrm_sync, home, office)
+        if not res:
+            return {"ok": False, "reason": "osrm_failed"}
+        secs, meters = res
+        mins = int(secs // 60)
+        return {
+            "ok": True,
+            "distance": f"{meters / 1000:.1f} km",
+            "eta_min": mins,
+            "normal_min": mins,
+            "delay_min": 0,
+            "condition": "free-flow estimate (no live traffic)",
+            "route": "the usual route",
+            "warnings": [],
+            "live_traffic": False,
+        }
+    except Exception as e:
+        log.warning(f"osrm fallback failed: {e}")
+        return {"ok": False, "reason": str(e)}
+
+
+async def get_traffic() -> dict:
+    """Home → office ETA. Prefer Google Routes (live traffic); if the key/API
+    isn't available, fall back to a keyless OSRM estimate so the commute still
+    works."""
+    res = await _google_routes_traffic()
+    if res.get("ok"):
+        return res
+    log.info(f"Google traffic unavailable ({str(res.get('reason'))[:80]}) — using OSRM fallback")
+    fb = await _osrm_fallback()
+    return fb if fb.get("ok") else res
 
 
 # ---- Weather -------------------------------------------------------------
@@ -220,7 +332,10 @@ async def get_sentiment() -> dict:
 
 
 async def open_dashboard_window() -> None:
-    """Open the portfolio dashboard in a small Chrome app window."""
+    """Disabled at user request — the briefing no longer opens the dashboard
+    window. Kept as a no-op so any stray caller is harmless."""
+    return
+    # (unreachable) original behaviour below
     dash = PORTFOLIO_DIR / "dashboard.html"
     if not dash.exists():
         return
