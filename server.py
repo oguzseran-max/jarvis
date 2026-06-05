@@ -1322,31 +1322,35 @@ async def _car_at_gate(img: bytes) -> bool:
 
 
 async def _close_gate_after_pass():
-    """After auto-opening, close the gate (toggle relay 1) once the car has driven
-    through — i.e. it was seen AT the gate and then is no longer there. Polls
-    snapshots; safety-closes after a max window so the gate never stays open."""
-    seen = False
+    """After auto-opening, close the gate (toggle relay 1) once the car is through.
+    User choice "30s + camera": close as soon as the camera sees the car AT the
+    gate and then gone, OR 30s after it first appears at the gate — whichever
+    first. The 30s starts when the car REACHES the gate (not at open time), so it
+    can't close while the car is still coming down the street. 180s hard ceiling."""
+    seen_at = 0.0
     start = time.time()
-    while time.time() - start < 120:
-        await asyncio.sleep(6)
+
+    async def _close(reason: str):
+        try:
+            await doorbird.open_gate()   # relay 1 toggle = close
+            log.info(f"[gate] closing ({reason})")
+        except Exception as e:
+            log.warning(f"gate close failed: {e}")
+
+    while time.time() - start < 180:
+        await asyncio.sleep(5)
         img = await doorbird.snapshot()
         if not img:
             continue
         if await _car_at_gate(img):
-            seen = True            # car has arrived at the gate
-        elif seen:
-            try:
-                await doorbird.open_gate()   # relay 1 toggle = close
-                log.info("[gate] car passed through -> closing")
-            except Exception as e:
-                log.warning(f"gate close failed: {e}")
-            return
-    if seen:
-        try:
-            await doorbird.open_gate()
-            log.info("[gate] closing on safety timeout")
-        except Exception:
-            pass
+            if not seen_at:
+                seen_at = time.time()                 # car has reached the gate
+            elif time.time() - seen_at >= 30:
+                await _close("30s after arrival"); return
+        elif seen_at:
+            await _close("car passed (camera)"); return
+    if seen_at:
+        await _close("safety ceiling")
 
 
 async def _on_gate_motion():
