@@ -141,7 +141,7 @@ YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT N
 - You CAN see what's on {user_name}'s screen — open windows, active apps, and screenshot vision
 - You CAN look through {user_name}'s webcam — a single on-demand photo via [ACTION:CAMERA]. Use it when he asks you to look at him or use the camera. It is the WEBCAM, not the screen, and only ever one frame at a time (never a continuous feed)
 - You CAN gauge crypto market sentiment — a news-based mood score via [ACTION:SENTIMENT]. Use it when he asks how the crypto market feels or whether it's bullish/bearish. It reads news headlines only; never present it as trading advice or a price prediction
-- You CAN play music on the house speakers via Spotify — any artist, song, album or playlist, plus pause/skip — with [ACTION:MUSIC]. Whenever {user_name} names an artist or song with intent to HEAR it, PLAY it; do NOT just describe the artist. Speech-to-text frequently mangles the play verb ("mets"/"joue"), so "Medoua Lipa", "et Dua Lipa", "Dua Lipa" all mean "mets Dua Lipa" → play her. If he just names music, assume he wants it played
+- You CAN play music on the house speakers via Spotify — any artist, song, album or playlist, plus pause/skip — with [ACTION:MUSIC]. When {user_name} clearly asks to PLAY/put on/change music, do it (don't just describe the artist). Speech-to-text often mangles the play verb, so a clear request like "Medoua Lipa" / "et Dua Lipa" still means "mets Dua Lipa". BUT use judgement: if he's ASKING ABOUT an artist (who is…, tell me about…), answer instead of playing; and if the input is a vague fragment, a single stray word, or could be background noise / song lyrics the mic picked up (music may be playing), do NOT play anything — respond briefly or not at all. Never change the music unless he actually asked
 - You ARE genuinely current on the news. Recent headlines (world/geopolitics, AI, technology, plus Geneva and Istanbul) are continuously refreshed into your WORLD NEWS context below. Answer news questions DIRECTLY and instantly from them — never "as of my knowledge cutoff", never a stalling "let me check". Use [ACTION:NEWS] ONLY for a deeper dive on something not in those headlines.
 - You CAN read {user_name}'s calendar — today's events, upcoming meetings, schedule overview
 - You CAN read {user_name}'s email (READ-ONLY) — unread count, recent messages, search by sender/subject. You CANNOT send, delete, or modify emails.
@@ -1199,8 +1199,9 @@ async def _execute_music(target: str, voice_state: dict, ws):
                "tr": "Spotify bağlı değil canım."}.get(lang, "Spotify isn't connected, sir.")
     else:
         res = None
+        is_pause = low in ("pause", "stop", "arrête", "arrete", "stoppe", "duraklat")
         try:
-            if low in ("pause", "stop", "arrête", "arrete", "stoppe", "duraklat"):
+            if is_pause:
                 res = await spotify_access.pause()
             elif low in ("next", "skip", "suivant", "suivante", "passe", "sonraki"):
                 res = await spotify_access.next_track()
@@ -1212,6 +1213,7 @@ async def _execute_music(target: str, voice_state: dict, ws):
             log.warning(f"[music] command failed: {e}")
         log.info(f"[music] target={t!r} -> ok={getattr(res, 'ok', None)} detail={getattr(res, 'detail', None)}")
         if res and res.ok:
+            _set_music_playing(not is_pause)
             return
         msg = {"fr": "Je n'arrive pas à lancer ça sur Spotify, mon amour.",
                "tr": "Bunu Spotify'da başlatamadım canım."}.get(
@@ -1223,6 +1225,53 @@ async def _execute_music(target: str, voice_state: dict, ws):
             await _speak_briefing(ws, voice_state, lang, audio, msg)
     except Exception:
         pass
+
+
+# ── "Marion" wake-word gate during music ──────────────────────────────────
+# Music plays on an EXTERNAL speaker (HEDDON), so the browser's echo-cancellation
+# can't remove it — the mic re-hears the music and Whisper transcribes stray
+# lyrics as commands (the feedback loop). While music is actually playing we
+# therefore only act on utterances that name Marion or are a clear playback
+# control; song lyrics never contain "Marion", so the loop is broken.
+_music_playing = False
+_music_checked_at = 0.0
+# Quick controls allowed WITHOUT the wake word, so "pause"/"next" stay instant.
+_MUSIC_CONTROL_WORDS = (
+    "marion", "pause", "stop", "arrête", "arrete", "coupe", "stoppe",
+    "suivant", "suivante", "next", "skip", "passe", "reprends", "resume",
+)
+
+
+def _set_music_playing(playing: bool) -> None:
+    global _music_playing, _music_checked_at
+    _music_playing = playing
+    _music_checked_at = time.time()
+
+
+async def _music_is_active() -> bool:
+    """True only while Spotify is REALLY playing. Trusts the flag for a few
+    seconds between confirmations (so there's no API call per utterance), then
+    verifies — this self-clears if the music ended or was paused elsewhere, so
+    the wake-word gate never gets stuck on."""
+    global _music_playing, _music_checked_at
+    if not _music_playing:
+        return False
+    if time.time() - _music_checked_at < 12:
+        return True
+    try:
+        now = await spotify_access.current_track()
+        _music_playing = bool(now and now.is_playing)
+    except Exception:
+        pass
+    _music_checked_at = time.time()
+    return _music_playing
+
+
+def _passes_music_gate(text: str) -> bool:
+    """Whether an utterance may act while music plays: it must name Marion or be
+    a direct playback control (lyrics caught by the mic satisfy neither)."""
+    low = text.lower()
+    return any(w in low for w in _MUSIC_CONTROL_WORDS)
 
 
 _VISITOR_LANG = {"fr": ("French", "mon amour"), "tr": ("Turkish", "canım")}
@@ -3704,6 +3753,21 @@ async def voice_handler(ws: WebSocket):
 
             voice_state["last_user_time"] = time.time()
             log.info(f"User: {user_text}")
+
+            # Wake-word gate: while music is actually playing, the mic re-hears the
+            # speakers, so ignore anything that doesn't name Marion or command
+            # playback — this breaks the music→mic→music feedback loop.
+            if await _music_is_active() and not _passes_music_gate(user_text):
+                log.info(f"[music-gate] ignored during playback: {user_text!r}")
+                # Critical: the frontend already flipped to "thinking" when it sent
+                # this utterance. Send it back to idle so the mic resumes — without
+                # this it hangs forever on "listening/thinking" (the reported bug).
+                try:
+                    await ws.send_json({"type": "status", "state": "idle"})
+                except Exception:
+                    pass
+                continue
+
             await ws.send_json({"type": "status", "state": "thinking"})
 
             # Lazy project scan on first message
@@ -3835,6 +3899,7 @@ async def voice_handler(ws: WebSocket):
                                 _ok = {"fr": "Je relance la musique.", "tr": "Müziğe devam."}.get(_lang, "Resuming, sir.")
                             if _res.ok:
                                 response_text = _ok
+                                _set_music_playing(_act != "pause")
                             else:
                                 response_text = {
                                     "fr": f"Je n'ai pas réussi, mon amour — {_res.detail}.",
