@@ -1217,6 +1217,12 @@ async def _on_doorbell():
     """Someone rang the gate: snapshot → describe the visitor → Marion announces it
     to whatever frontend is connected. The user can then say 'ouvre le portail'."""
     lang = "fr"  # Marion is the default persona
+    # Tell the frontend to surge the live camera to centre-screen (Hollywood
+    # zoom) the instant it rings — before the slower snapshot/description.
+    try:
+        await task_manager._notify({"type": "gate_ring"})
+    except Exception:
+        pass
     img = await doorbird.snapshot()
     desc = ""
     if img:
@@ -2025,6 +2031,20 @@ async def api_selfeval_stats():
     except Exception:
         return {"window_h": 24, "total": 0, "by_kind": {}, "recent": [],
                 "vocab_total": 0, "prefs_total": 0, "max_tokens": 140}
+
+
+@app.post("/api/gate/test_ring")
+async def api_gate_test_ring(request: Request):
+    """Local-only: simulate a gate ring to preview the centre-screen camera
+    surge without physically ringing."""
+    client = request.client.host if request.client else ""
+    if not (client.startswith("127.") or client in ("::1", "localhost")):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        await task_manager._notify({"type": "gate_ring"})
+    except Exception:
+        pass
+    return {"ok": True}
 
 
 @app.get("/api/watchguard/stats")

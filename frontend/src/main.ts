@@ -75,10 +75,12 @@ const securityHud = createSecurityHud(); // mid-left live WatchGuard threat pane
 const learningHud = createLearningHud(); // mid-right live Self-Evolution panel
 const buildHud = createBuildHud(); // middle-right progress panel for background builds
 
-// Live gate camera (DoorBird) — small panel bottom-left, next to DIAGNOSTICS.
-// The MJPEG stream is proxied by the backend (creds stay server-side).
-(function gateCam() {
+// Live gate camera (DoorBird) — a small panel bottom-left, PLUS a centre-screen
+// "spotlight" that surges the live view to the middle of the screen when someone
+// rings (Hollywood zoom). The MJPEG stream is proxied by the backend.
+const gateCam = (function gateCam() {
   const C = "76, 168, 232";
+  const VIDEO = "/api/doorbird/video";
   const style = document.createElement("style");
   style.textContent = `
     #gate-cam { position: fixed; bottom: 22px; left: 250px; z-index: 4; width: 250px;
@@ -91,19 +93,83 @@ const buildHud = createBuildHud(); // middle-right progress panel for background
     #gate-cam .gc-dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e;
       box-shadow: 0 0 6px #22c55e; animation: gcblink 2s ease-in-out infinite; }
     @keyframes gcblink { 50% { opacity: .3; } }
-    /* Landscape strip — fixed height so it lines up with the DIAGNOSTICS panel. */
     #gate-cam img { display: block; width: 100%; height: 92px; object-fit: cover; background:#05070c; }
+
+    /* ── Centre-screen spotlight (on ring) ───────────────────────────────── */
+    #gate-spot { position: fixed; left: 50%; top: 52%; z-index: 30;
+      width: min(640px, 74vw); pointer-events: auto; cursor: pointer;
+      transform: translate(-50%,-50%) scale(0.35) rotateX(10deg);
+      opacity: 0; visibility: hidden;
+      transition: opacity .45s ease, transform .7s cubic-bezier(.16,.9,.2,1.25), visibility .45s;
+      border: 1px solid rgba(${C},0.65); border-radius: 14px; overflow: hidden;
+      background: #04070d; font-family: ui-monospace, Menlo, monospace;
+      box-shadow: 0 0 70px rgba(${C},0.5), inset 0 0 0 1px rgba(${C},0.25); }
+    #gate-spot.show { opacity: 1; visibility: visible;
+      transform: translate(-50%,-50%) scale(1) rotateX(0deg); }
+    #gate-spot .gs-head { display: flex; align-items: center; gap: 9px;
+      font-size: 12px; letter-spacing: 3px; text-transform: uppercase;
+      color: #ff5b5b; padding: 9px 14px; border-bottom: 1px solid rgba(${C},0.22);
+      background: linear-gradient(90deg, rgba(255,60,60,0.12), transparent); }
+    #gate-spot .gs-dot { width: 9px; height: 9px; border-radius: 50%; background: #ff3b3b;
+      box-shadow: 0 0 10px #ff3b3b; animation: gcblink 0.9s ease-in-out infinite; }
+    #gate-spot .gs-head .grow { flex: 1; }
+    #gate-spot .gs-hint { font-size: 8px; letter-spacing: 1.5px; color: rgba(${C},0.55); }
+    #gate-spot img { display: block; width: 100%; height: min(400px, 48vh);
+      object-fit: cover; background: #05070c; }
+    /* sweeping scanline + corner brackets for the futuristic feel */
+    #gate-spot .gs-scan { position: absolute; left: 0; right: 0; top: 38px; height: 2px;
+      background: linear-gradient(90deg, transparent, rgba(${C},0.7), transparent);
+      animation: gs-scan 2.4s linear infinite; pointer-events: none; }
+    @keyframes gs-scan { 0% { top: 38px; } 100% { top: 100%; } }
+    #gate-spot .gb { position: absolute; width: 18px; height: 18px; border: 2px solid rgba(${C},0.8); pointer-events: none; }
+    #gate-spot .gb.tl { top: 6px; left: 6px; border-right: 0; border-bottom: 0; }
+    #gate-spot .gb.tr { top: 6px; right: 6px; border-left: 0; border-bottom: 0; }
+    #gate-spot .gb.bl { bottom: 6px; left: 6px; border-right: 0; border-top: 0; }
+    #gate-spot .gb.br { bottom: 6px; right: 6px; border-left: 0; border-top: 0; }
   `;
   document.head.appendChild(style);
+
+  // small persistent panel
   const box = document.createElement("div");
   box.id = "gate-cam";
   box.innerHTML = `<div class="gc-head"><span class="gc-dot"></span>PORTAIL · LIVE</div>`;
   const img = document.createElement("img");
   img.alt = "Portail";
-  img.src = "/api/doorbird/video";
-  img.onerror = () => { box.style.display = "none"; };  // hide if DoorBird unavailable
+  img.src = VIDEO;
+  img.onerror = () => { box.style.display = "none"; };
   box.appendChild(img);
   document.body.appendChild(box);
+
+  // centre-screen spotlight (hidden until a ring)
+  const spot = document.createElement("div");
+  spot.id = "gate-spot";
+  spot.innerHTML = `
+    <div class="gs-head"><span class="gs-dot"></span><span>Portail · Sonnerie</span>
+      <span class="grow"></span><span class="gs-hint">cliquer pour fermer</span></div>
+    <div class="gs-scan"></div>
+    <span class="gb tl"></span><span class="gb tr"></span><span class="gb bl"></span><span class="gb br"></span>`;
+  const spotImg = document.createElement("img");
+  spotImg.alt = "Portail (live)";
+  spot.appendChild(spotImg);
+  document.body.appendChild(spot);
+
+  let hideTimer = 0;
+  function close() {
+    window.clearTimeout(hideTimer);
+    spot.classList.remove("show");
+    spotImg.src = "";          // stop the spotlight stream
+    img.src = VIDEO;           // resume the small live panel
+  }
+  function ringAlert() {
+    window.clearTimeout(hideTimer);
+    img.src = "";              // free the single DoorBird stream for the spotlight
+    spotImg.src = VIDEO;
+    spot.classList.add("show");
+    hideTimer = window.setTimeout(close, 22000);  // auto-dismiss after ~22s
+  }
+  spot.addEventListener("click", close);
+
+  return { ringAlert };
 })();
 
 // Weather effects: rain/sun screen FX + Marion's outfit follows the weather
@@ -328,6 +394,9 @@ socket.onMessage((msg) => {
     // Voice command ("coupe la musique") — fade the music out, then pause it.
     fadeMusicTo(0, 800);
     setTimeout(() => { try { bootMusic.pause(); } catch {} }, 900);
+  } else if (type === "gate_ring") {
+    // Someone rang the gate — surge the live camera to centre-screen.
+    gateCam.ringAlert();
   }
 });
 
