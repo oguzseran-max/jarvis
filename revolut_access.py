@@ -38,7 +38,7 @@ REVX_API_KEY = os.getenv("REVOLUT_X_API_KEY", "").strip()
 REVX_PRIVATE_KEY_PATH = os.getenv("REVOLUT_X_PRIVATE_KEY", "").strip()
 REVX_BALANCES_PATH = "/api/1.0/balances"
 # Public market-data tickers (no auth) — used to value crypto holdings in fiat.
-REVX_TICKERS_PATH = os.getenv("REVOLUT_X_TICKERS_PATH", "/api/1.0/market/tickers")
+REVX_TICKERS_PATH = os.getenv("REVOLUT_X_TICKERS_PATH", "/api/1.0/tickers")
 
 # Fiat currency that crypto holdings are valued in (must be a quote currency on
 # Revolut X, e.g. USD/EUR/GBP). Each holding is priced against "<SYMBOL>-<quote>".
