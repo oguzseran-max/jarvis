@@ -1318,10 +1318,12 @@ async def _on_gate_motion():
         await task_manager.push_speech("Ta voiture arrive, mon amour.", lang="fr")
     except Exception as e:
         log.warning(f"car announce failed: {e}")
-    if GATE_AUTO_OPEN_FOR_CAR:
+    # Auto-open only on an EXACT plate match (the announce above tolerates one
+    # OCR slip, but opening a physical gate must not act on a fuzzy read).
+    if GATE_AUTO_OPEN_FOR_CAR and plate == OZ_PLATE_NORM:
         try:
             await doorbird.open_gate()
-            log.info("[gate] auto-opened for Oz's car")
+            log.info("[gate] auto-opened for Oz's car (exact plate match)")
         except Exception as e:
             log.warning(f"auto-open failed: {e}")
 

@@ -62,3 +62,6 @@ data/faces/
 # Face recognition (heavy venv + face embeddings — keep out of git)
 face-venv/
 data/face_db.npz
+
+# Personal reference media (car photo etc.)
+references/
