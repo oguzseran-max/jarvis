@@ -54,3 +54,11 @@ gmail_token.json
 tools/boot_build/sep/
 tools/boot_build/voice/
 tools/boot_build/shot_*.png
+
+# Family face-enrollment reference photos — NEVER commit (children's photos)
+faces/
+data/faces/
+
+# Face recognition (heavy venv + face embeddings — keep out of git)
+face-venv/
+data/face_db.npz

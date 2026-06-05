@@ -27,6 +27,18 @@ else
   echo "[jarvis] whisper-venv missing; STT auto-detect disabled" >&2
 fi
 
+# Face-recognition service (separate Python 3.12 venv — insightface). Powers the
+# surveillance mode that greets Leyla / Aylin by name.
+if pgrep -f "face_service.py" >/dev/null 2>&1; then
+  echo "[jarvis] face service already running"
+elif [ -x "$JARVIS_DIR/face-venv/bin/python" ]; then
+  echo "[jarvis] starting face service on :8770"
+  ( cd "$JARVIS_DIR" && nohup ./face-venv/bin/python face_service.py \
+      >"$LOG_DIR/face.log" 2>&1 & )
+else
+  echo "[jarvis] face-venv missing; surveillance face-recognition disabled" >&2
+fi
+
 # Backend
 if port_up "$BACKEND_PORT"; then
   echo "[jarvis] backend already running on :$BACKEND_PORT"

@@ -14,6 +14,7 @@ import { createBoot } from "./boot";
 import { createCornerHud } from "./hud";
 import { createSecurityHud } from "./security_hud";
 import { createLearningHud } from "./learning_hud";
+import { createSurveillance } from "./surveillance";
 import { createAudioPlayer } from "./voice";
 import { createAudioCapture } from "./audio_capture";
 import { createSocket } from "./ws";
@@ -198,6 +199,10 @@ const socket = createSocket(WS_URL);
 // dropped socket never leaves the server on unreliable language auto-detect
 // (which made Marion answer in English).
 socket.onOpen(() => socket.send({ type: "set_lang", lang: currentLang }));
+
+// Surveillance (webcam face watch) — toggled by the backend on the voice
+// command "active/désactive la surveillance".
+const surveillance = createSurveillance((m) => socket.send(m));
 
 const audioPlayer = createAudioPlayer();
 orb.setAnalyser(audioPlayer.getAnalyser());
@@ -400,6 +405,9 @@ socket.onMessage((msg) => {
   } else if (type === "gate_ring") {
     // Someone rang the gate — surge the live camera to centre-screen.
     gateCam.ringAlert();
+  } else if (type === "watch_mode") {
+    // Backend toggled surveillance (voice command).
+    if (msg.on) surveillance.start(); else surveillance.stop();
   }
 });
 

@@ -1213,6 +1213,43 @@ async def _describe_visitor(frame_b64: str, lang: str = "fr") -> str:
         return ""
 
 
+# ── Surveillance mode — local face recognition (insightface microservice) ───
+# When away, the browser streams webcam frames here; if Leyla or Aylin is
+# recognised, Marion greets her by name (once per cooldown window). On-device.
+FACE_SERVICE_URL = os.getenv("FACE_SERVICE_URL", "http://127.0.0.1:8770")
+_surveillance = {"on": False}
+_greet_cooldown: dict = {}
+GREET_COOLDOWN_S = int(os.getenv("GREET_COOLDOWN_S", "600"))  # 10 min per person
+
+
+async def _recognize_and_greet(jpeg: bytes):
+    """Send one webcam frame to the local face service; greet a recognised child
+    at most once per cooldown window."""
+    if not jpeg or not _surveillance["on"]:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            r = await http.post(f"{FACE_SERVICE_URL}/recognize", content=jpeg,
+                                headers={"Content-Type": "application/octet-stream"})
+        if r.status_code != 200:
+            return
+        name = r.json().get("name")
+    except Exception:
+        return
+    if not name:
+        return
+    now = time.time()
+    if now - _greet_cooldown.get(name, 0) < GREET_COOLDOWN_S:
+        return
+    _greet_cooldown[name] = now
+    greeting = f"Bonjour {name}, ça me fait plaisir de te voir. Comment vas-tu ?"
+    log.info(f"[surveillance] recognised {name} -> greeting")
+    try:
+        await task_manager.push_speech(greeting, lang="fr")
+    except Exception as e:
+        log.warning(f"surveillance greet failed: {e}")
+
+
 async def _on_doorbell():
     """Someone rang the gate: snapshot → describe the visitor → Marion announces it
     to whatever frontend is connected. The user can then say 'ouvre le portail'."""
@@ -3393,6 +3430,18 @@ async def voice_handler(ws: WebSocket):
                     voice_state.pop("did_stream", None)
                     continue
 
+                # ── Surveillance: a webcam frame from the browser (motion-gated).
+                #    Recognise off the WS loop so it never delays voice. ──
+                if msg.get("type") == "watch_frame":
+                    if _surveillance["on"]:
+                        try:
+                            _data = (msg.get("data") or "").split(",")[-1]
+                            _frame = base64.b64decode(_data)
+                            asyncio.create_task(_recognize_and_greet(_frame))
+                        except Exception:
+                            pass
+                    continue
+
                 # ── Briefing prefetch: start gathering DURING the boot screen so
                 #    the briefing is ready the instant the boot finishes. ──
                 if msg.get("type") == "briefing_prefetch":
@@ -3518,6 +3567,35 @@ async def voice_handler(ws: WebSocket):
                     response_text = {"fr": "Comme tu veux, mon amour.",
                                      "tr": "Nasıl istersen canım."}.get(
                         voice_state.get("lang", "en"), "As you wish, sir.")
+
+                # ── Surveillance mode on/off (voice) — webcam face watch ──
+                elif any(p in t_lower for p in (
+                    "active la surveillance", "démarre la surveillance", "demarre la surveillance",
+                    "lance la surveillance", "mode surveillance", "surveille la maison",
+                    "mets la surveillance", "active la caméra de surveillance",
+                )):
+                    _surveillance["on"] = True
+                    try:
+                        await ws.send_json({"type": "watch_mode", "on": True})
+                    except Exception:
+                        pass
+                    response_text = {"fr": "Surveillance activée, mon amour. Je veille sur la maison.",
+                                     "tr": "Gözetim açık canım."}.get(
+                        voice_state.get("lang", "en"), "Surveillance on, sir.")
+
+                elif any(p in t_lower for p in (
+                    "désactive la surveillance", "desactive la surveillance",
+                    "arrête la surveillance", "arrete la surveillance",
+                    "coupe la surveillance", "stop la surveillance",
+                )):
+                    _surveillance["on"] = False
+                    try:
+                        await ws.send_json({"type": "watch_mode", "on": False})
+                    except Exception:
+                        pass
+                    response_text = {"fr": "Surveillance désactivée.",
+                                     "tr": "Gözetim kapalı canım."}.get(
+                        voice_state.get("lang", "en"), "Surveillance off, sir.")
 
                 # ── Real music control via Spotify (artist/title/playlist,
                 # pause, next). spotify_access.parse_command extracts the query
