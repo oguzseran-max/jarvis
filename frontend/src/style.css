@@ -678,7 +678,7 @@ body.marion-mode #orb-canvas {
   letter-spacing: 0.06em;
 }
 .hud-corner.tl { top: 56px; left: 18px; }
-.hud-corner.tr { top: 22px; right: 290px; text-align: right; }
+.hud-corner.tr { top: 60px; right: 290px; text-align: right; }
 .hud-corner.bl { bottom: 22px; left: 18px; }
 .hud-corner.br { bottom: 22px; right: 18px; text-align: right; }
 

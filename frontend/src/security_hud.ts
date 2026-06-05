@@ -22,7 +22,7 @@ interface WgStats {
 
 const CSS = `
 #sec-hud {
-  position: fixed; right: 22px; top: 22px;
+  position: fixed; right: 22px; top: 60px;
   width: 252px; z-index: 4; pointer-events: none;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   color: rgba(${C}, 0.92);
