@@ -53,9 +53,18 @@ _lock = threading.Lock()  # faster-whisper isn't meant for concurrent calls
 # toward the household's proper nouns and habits (kept brief to avoid the model
 # echoing these words into silence). English left unprimed.
 _PRIMERS = {
-    "fr": ("Conversation familière en français avec Marion. "
-           "mon amour, Leyla, Aylin, Spotify, Phil Collins, la musique, "
-           "le salon, la mezzanine, la cuisine, le portail, les lumières, la météo."),
+    # Hand-curated French seed: household proper nouns + the exact command
+    # phrasings that were being mis-heard (e.g. "tenue de pluie" -> "police").
+    # Kept to ~2 sentences so Whisper doesn't echo it back on silence. Words the
+    # user explicitly corrects are added on top of this by self_eval (the
+    # whisper_vocab_fr.txt layer), so this only needs the stable household core.
+    "fr": ("Conversation familière en français avec Marion, à Veigy-Foncenex, "
+           "en Haute-Savoie près de Genève. "
+           "mon amour, Leyla, Aylin, Oz, Spotify, Phil Collins, la musique, "
+           "le salon, la mezzanine, la cuisine, le portail, la voiture, "
+           "les lumières, la météo, la surveillance. "
+           "mets-toi en bikini, mets ta tenue de pluie, ta tenue normale, "
+           "suis la météo, ouvre le portail, allume les lumières."),
     "tr": "Türkçe sohbet. Marion, müzik, Spotify, ışıklar, kapı, hava durumu.",
 }
 
