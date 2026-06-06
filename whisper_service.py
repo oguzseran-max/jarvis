@@ -29,14 +29,13 @@ from faster_whisper.audio import decode_audio
 MODEL_SIZE = os.getenv("WHISPER_MODEL", "small")
 PORT = int(os.getenv("WHISPER_PORT", "8765"))
 ALLOWED = {l.strip() for l in os.getenv("WHISPER_LANGS", "en,fr,tr").split(",") if l.strip()}
-# Decode beam width. Beam search runs the decoder ~BEAM_SIZE times per step, so on
-# a CPU int8 model it is the dominant transcription cost and scales with utterance
-# length — the recurring "slow transcription" flag. Default to greedy decoding (1),
-# which roughly halves latency; the decoder is already primed with in-domain vocab
-# and downstream speech-correction catches the rare extra mishear. Raise via
-# WHISPER_BEAM_SIZE (e.g. 5) to trade latency back for accuracy. max(1, …) guards
-# against a misconfigured 0/negative value being handed to the decoder.
-BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1")))
+# Decode beam width. Greedy (beam=1) is faster, BUT on this room mic (music +
+# ambient) it both garbled transcripts and lowered avg_logprob enough that the
+# confidence filter below dropped real speech — Marion stopped "hearing" the user.
+# Beam search finds higher-probability paths, so 5 is the reliable default for
+# listening; the CPU_THREADS cap below recovers most of the speed. max(1, …) guards
+# a misconfigured 0/negative. Override via WHISPER_BEAM_SIZE to trade speed back.
+BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "5")))
 
 # CPU thread count. ctranslate2 defaults to only 4 threads, so giving it the full
 # core count helps — UP TO A POINT. Past ~8 threads an int8 model oversubscribes
