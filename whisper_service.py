@@ -45,8 +45,35 @@ BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "5")))
 # unaffected, and WHISPER_CPU_THREADS still overrides explicitly.
 CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", str(min(os.cpu_count() or 4, 8))))
 
-print(f"[whisper] loading model '{MODEL_SIZE}' (beam={BEAM_SIZE}, threads={CPU_THREADS}) …", flush=True)
-model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
+# Transcription backend.
+#   "faster" — faster-whisper / CTranslate2 on CPU. The default, fully tested,
+#              and the only real option on Intel Macs.
+#   "mlx"    — Apple MLX on Apple-Silicon GPU + Neural Engine. Runs large models
+#              at ~real time, so on the new Mac you get large-v3-turbo / a French
+#              fine-tune WITHOUT the CPU latency. Needs `pip install mlx-whisper`.
+# If "mlx" is requested but not importable we fall back to faster-whisper so the
+# service never goes deaf. Full migration steps: docs/whisper-apple-silicon.md
+WHISPER_BACKEND = os.getenv("WHISPER_BACKEND", "faster").lower()
+# HF repo for the MLX model. Defaults to the MLX community mirror of WHISPER_MODEL;
+# point it at e.g. a French fine-tune via WHISPER_MLX_REPO.
+_MLX_REPO = os.getenv("WHISPER_MLX_REPO", f"mlx-community/whisper-{MODEL_SIZE}")
+
+_use_mlx = False
+_mlx = None
+if WHISPER_BACKEND == "mlx":
+    try:
+        import mlx_whisper as _mlx  # type: ignore
+        _use_mlx = True
+    except Exception as _e:
+        print(f"[whisper] mlx backend requested but unavailable ({_e}); "
+              f"falling back to faster-whisper", flush=True)
+
+if _use_mlx:
+    print(f"[whisper] backend=mlx repo='{_MLX_REPO}' (Apple Silicon GPU/ANE)", flush=True)
+    model = None  # mlx loads + caches the weights on first transcribe
+else:
+    print(f"[whisper] loading model '{MODEL_SIZE}' (beam={BEAM_SIZE}, threads={CPU_THREADS}) …", flush=True)
+    model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
 _lock = threading.Lock()  # faster-whisper isn't meant for concurrent calls
 
 # Per-language decoder primers — short, in-domain vocabulary that nudges Whisper
@@ -134,6 +161,48 @@ def _is_hallucination(text: str) -> bool:
     return any(h in t for h in _HALLUCINATIONS)
 
 
+class _MlxSeg:
+    """Adapter so MLX segments expose the same attributes the confidence filter
+    reads off faster-whisper segments (.text / .avg_logprob / .no_speech_prob)."""
+    __slots__ = ("text", "avg_logprob", "no_speech_prob")
+
+    def __init__(self, d):
+        self.text = d.get("text", "")
+        self.avg_logprob = d.get("avg_logprob", 0.0)
+        self.no_speech_prob = d.get("no_speech_prob", 0.0)
+
+
+class _MlxInfo:
+    __slots__ = ("language", "language_probability")
+
+    def __init__(self, language, prob):
+        self.language = language
+        self.language_probability = prob
+
+
+def _decode(audio, forced):
+    """Run the active backend, returning (segments, info) shaped like
+    faster-whisper's so everything downstream (confidence filter, language,
+    hallucination check) is backend-agnostic."""
+    if _use_mlx:
+        res = _mlx.transcribe(
+            audio, path_or_hf_repo=_MLX_REPO, language=forced,
+            initial_prompt=_primer_for(forced), no_speech_threshold=0.6,
+            condition_on_previous_text=False, word_timestamps=False,
+        )
+        segs = [_MlxSeg(s) for s in res.get("segments", [])]
+        lang = res.get("language") or forced or "en"
+        return segs, _MlxInfo(lang, 1.0 if forced else 0.5)
+    # faster-whisper (CPU) — the default, fully-tested path. Params are exactly
+    # those tuned in place above; only the call site moved here for dispatch.
+    return model.transcribe(
+        audio, language=forced, beam_size=BEAM_SIZE, vad_filter=True,
+        no_speech_threshold=0.6, compression_ratio_threshold=2.2,
+        temperature=[0.0, 0.2], condition_on_previous_text=False,
+        without_timestamps=True, initial_prompt=_primer_for(forced),
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
@@ -184,36 +253,9 @@ class Handler(BaseHTTPRequestHandler):
             if peak >= 0.02:
                 audio = audio * min(0.95 / peak, 10.0)
                 with _lock:
-                    segments, info = model.transcribe(
-                        audio, language=forced, beam_size=BEAM_SIZE,
-                        vad_filter=True,
-                        no_speech_threshold=0.6,
-                        compression_ratio_threshold=2.2,
-                        # Temperature fallback: faster-whisper RE-DECODES any window
-                        # that fails its quality thresholds, stepping through this
-                        # list. The default is 6 steps ([0.0..1.0]); on this room mic
-                        # vocal music reads as "speech" to the VAD, fails the
-                        # thresholds, and gets re-decoded 6× at beam=5 — the
-                        # pathological "slow transcription" tail (a one-word clip
-                        # measured at 9s, an 18s clip at 29s) — only for that garbled
-                        # output to be dropped by the confidence filter below. Real
-                        # speech decodes cleanly at 0.0 and never falls back, so
-                        # capping at two steps cuts the wasted retries without
-                        # touching accepted-speech accuracy. One fallback (0.2) is
-                        # kept as a safety net for genuinely hard-but-real speech.
-                        temperature=[0.0, 0.2],
-                        condition_on_previous_text=False,
-                        # We only ever join sg.text — never the per-segment
-                        # timestamps. Telling the decoder not to predict timestamp
-                        # tokens drops tokens-per-segment, trimming decode time on
-                        # every utterance at zero cost to the transcript.
-                        without_timestamps=True,
-                        # Prime the decoder with in-domain French/Turkish words so
-                        # proper nouns and household vocabulary are recognised
-                        # correctly (costs ~nothing, improves accuracy). Includes
-                        # words self_eval has learned from the user's corrections.
-                        initial_prompt=_primer_for(forced),
-                    )
+                    # Backend-agnostic decode (faster-whisper on CPU, or MLX on
+                    # Apple Silicon). Params for the faster path live in _decode.
+                    segments, info = _decode(audio, forced)
                     # Drop low-confidence segments: when music plays on an external
                     # speaker the mic catches it and Whisper "hears voices" (garbled
                     # lyrics). Real speech sits well above -1.1 avg_logprob; gibberish
