@@ -63,6 +63,7 @@ import did_avatar
 import spotify_access
 import self_eval
 import perf_monitor
+import bug_fixer
 import plejd_lights
 import doorbird
 
@@ -2269,6 +2270,14 @@ async def lifespan(application: FastAPI):
     asyncio.create_task(_hourly_context_refresh())
     self_eval.init()  # continuous self-improvement (Phase 1)
     perf_monitor.init()  # real-time per-turn telemetry + bug flags (Phase 0)
+    bug_fixer.init()  # autonomous bug→fix loop (Phase 2)
+    bug_fixer.set_speak_sink(
+        lambda text, lang="fr": asyncio.create_task(task_manager.push_speech(text, lang)))
+    # Only run the UNATTENDED timer when explicitly allowed (BUGFIX_ENABLED=true).
+    # Otherwise detection/fix runs only on demand via POST /api/bugfix/scan.
+    if bug_fixer.is_enabled():
+        asyncio.create_task(bug_fixer.loop())  # detect recurring bugs → draft fixes
+        log.warning("bug-fixer AUTONOMOUS timer is ON (writes code unattended)")
     log.info("JARVIS server starting")
 
     # Monitor the DoorBird gate intercom: announce + describe visitors on a ring.
@@ -2467,6 +2476,51 @@ async def api_perf_flags():
     autonomous fix loop will consume."""
     try:
         return JSONResponse({"flags": perf_monitor.recent_flags(24)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/bugfix/list")
+async def api_bugfix_list():
+    """Autonomous fix records (Phase 2) — for the review panel."""
+    try:
+        return JSONResponse({"fixes": bug_fixer.list_fixes(25)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/bugfix/scan")
+async def api_bugfix_scan():
+    """Force a detection pass now (otherwise runs on a timer)."""
+    try:
+        return JSONResponse(await bug_fixer.detect_and_fix(force=True))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/bugfix/{fix_id}/diff")
+async def api_bugfix_diff(fix_id: int):
+    """Full patch of a proposed fix, for human review before approval."""
+    try:
+        return JSONResponse({"diff": await bug_fixer.diff(fix_id)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/bugfix/{fix_id}/approve")
+async def api_bugfix_approve(fix_id: int):
+    """Land a READY fix (merge its branch). The one human-gated write path."""
+    try:
+        return JSONResponse(await bug_fixer.approve(fix_id))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/bugfix/{fix_id}/dismiss")
+async def api_bugfix_dismiss(fix_id: int):
+    """Discard a proposed fix (remove worktree + branch)."""
+    try:
+        return JSONResponse(await bug_fixer.dismiss(fix_id))
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
