@@ -329,6 +329,16 @@ async def record_turn(client, *, user_text: str, reply_text: str, lang: str,
         pass
 
 
+_speak = None  # optional voice sink, wired by server.py (avoids a circular import)
+
+
+def set_speak_sink(fn) -> None:
+    """Let server.py give self_eval a way to make Marion speak (for the active
+    confirmation when she learns a corrected word)."""
+    global _speak
+    _speak = fn
+
+
 async def _evaluate(client, turn_id, lang, user_text, reply_text, prev_user, prev_reply) -> None:
     try:
         payload = (
@@ -360,9 +370,24 @@ async def _evaluate(client, turn_id, lang, user_text, reply_text, prev_user, pre
                 pass
 
         # Auto-apply: vocabulary
+        learned = []
         for w in (data.get("vocab") or [])[:4]:
             if _add_vocab(lang, str(w)):
                 _log_change("vocab", f"nouveau mot appris : « {str(w).strip()} »")
+                learned.append(str(w).strip())
+
+        # Active confirmation: when the user was CORRECTING Marion and she just
+        # learned the word, say so out loud so he knows it stuck. Bounded to
+        # corrections so she doesn't comment on every proper noun.
+        if learned and _speak and looks_like_correction(user_text, lang):
+            word = learned[0]
+            msg = {"fr": f"C'est noté, {word}. Je m'en souviendrai.",
+                   "tr": f"Not aldım, {word}. Aklımda tutacağım."}.get(
+                       lang, f"Noted — {word}. I'll remember that.")
+            try:
+                _speak(msg, lang)
+            except Exception:
+                pass
 
         # Auto-apply: preference
         pref = str(data.get("preference") or "").strip()

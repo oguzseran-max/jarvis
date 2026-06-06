@@ -2293,6 +2293,8 @@ async def lifespan(application: FastAPI):
     # never more than an hour stale; weather/news/screen refresh faster above.
     asyncio.create_task(_hourly_context_refresh())
     self_eval.init()  # continuous self-improvement (Phase 1)
+    self_eval.set_speak_sink(
+        lambda text, lang="fr": asyncio.create_task(task_manager.push_speech(text, lang)))
     perf_monitor.init()  # real-time per-turn telemetry + bug flags (Phase 0)
     bug_fixer.init()  # autonomous bug→fix loop (Phase 2)
     bug_fixer.set_speak_sink(
