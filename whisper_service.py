@@ -180,6 +180,19 @@ class Handler(BaseHTTPRequestHandler):
                         vad_filter=True,
                         no_speech_threshold=0.6,
                         compression_ratio_threshold=2.2,
+                        # Temperature fallback: faster-whisper RE-DECODES any window
+                        # that fails its quality thresholds, stepping through this
+                        # list. The default is 6 steps ([0.0..1.0]); on this room mic
+                        # vocal music reads as "speech" to the VAD, fails the
+                        # thresholds, and gets re-decoded 6× at beam=5 — the
+                        # pathological "slow transcription" tail (a one-word clip
+                        # measured at 9s, an 18s clip at 29s) — only for that garbled
+                        # output to be dropped by the confidence filter below. Real
+                        # speech decodes cleanly at 0.0 and never falls back, so
+                        # capping at two steps cuts the wasted retries without
+                        # touching accepted-speech accuracy. One fallback (0.2) is
+                        # kept as a safety net for genuinely hard-but-real speech.
+                        temperature=[0.0, 0.2],
                         condition_on_previous_text=False,
                         # We only ever join sg.text — never the per-segment
                         # timestamps. Telling the decoder not to predict timestamp
