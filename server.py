@@ -376,15 +376,16 @@ def _fetch_weather_string_sync() -> Optional[str]:
         url = (
             "https://api.open-meteo.com/v1/forecast"
             f"?latitude={location['latitude']}&longitude={location['longitude']}"
-            f"&current=temperature_2m,weathercode&temperature_unit={unit}"
+            f"&current=temperature_2m,weathercode,precipitation&temperature_unit={unit}"
         )
         with _ureq.urlopen(url, timeout=3) as resp:
             current = json.loads(resp.read()).get("current", {})
         temp = current.get("temperature_2m")
         if temp is None:
             return None
-        global _cached_weather_code
+        global _cached_weather_code, _cached_precip
         _cached_weather_code = current.get("weathercode")
+        _cached_precip = current.get("precipitation")
         return f"Current weather in {location['label']}: {temp}{unit_symbol}"
     except Exception as e:
         log.debug(f"Weather fetch failed: {e}")
@@ -392,10 +393,15 @@ def _fetch_weather_string_sync() -> Optional[str]:
 
 
 _cached_weather_code: Optional[int] = None
+_cached_precip: Optional[float] = None
 
 
 def _weather_condition() -> str:
-    """Map the WMO weathercode to a simple condition for the UI effects."""
+    """Map the WMO weathercode to a simple condition for the UI effects + Marion's
+    outfit. Slight/shower codes (drizzle, "slight rain showers") are reported by
+    Open-Meteo even on a mostly sunny day with a passing or nearby shower, which
+    is exactly when Marion wrongly turned up in rain gear. So for those soft codes
+    we require ACTUAL current precipitation; heavy/steady rain always counts."""
     c = _cached_weather_code
     if c is None:
         return "unknown"
@@ -409,8 +415,12 @@ def _weather_condition() -> str:
         return "snow"
     if c in (95, 96, 99):
         return "storm"
-    if c in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82):
+    # Heavy / steady rain → always rain.
+    if c in (63, 65, 66, 67, 81, 82):
         return "rain"
+    # Drizzle / slight showers → only if it's genuinely precipitating right now.
+    if c in (51, 53, 55, 56, 57, 61, 80):
+        return "rain" if (_cached_precip or 0) > 0 else "clouds"
     return "clouds"
 
 
