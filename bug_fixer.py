@@ -49,12 +49,11 @@ _REPO = Path(__file__).resolve().parent
 _DB = _REPO / "data" / "bugfix.db"
 _WORKTREE_ROOT = Path(tempfile.gettempdir()) / "jarvis-bugfix"
 
-# Tunables (env-overridable).
+# Tunables (env-overridable). The enable flag is read LIVE (not cached) so it's
+# robust to .env load order and can be flipped without a code change.
 # OFF by default: the unattended timer writes code (via skip-permissions claude),
 # so it stays opt-in. With it off, detection still records recurring bugs and you
 # can draft a fix on demand via POST /api/bugfix/scan (an explicit human action).
-# Set BUGFIX_ENABLED=true to allow the autonomous timer.
-_ENABLED = os.getenv("BUGFIX_ENABLED", "false").lower() == "true"
 _INTERVAL = int(os.getenv("BUGFIX_INTERVAL", "300"))            # detector tick (s)
 _MIN_OCCURRENCES = int(os.getenv("BUGFIX_MIN_OCCURRENCES", "3"))
 _COOLDOWN_H = float(os.getenv("BUGFIX_COOLDOWN_HOURS", "6"))
@@ -72,8 +71,9 @@ def set_speak_sink(fn: Callable[[str, str], object]) -> None:
 
 
 def is_enabled() -> bool:
-    """True only when the unattended code-writing timer is explicitly allowed."""
-    return _ENABLED
+    """True only when the unattended code-writing timer is explicitly allowed.
+    Read live so BUGFIX_ENABLED takes effect regardless of .env load order."""
+    return os.getenv("BUGFIX_ENABLED", "false").lower() == "true"
 
 
 def _conn() -> sqlite3.Connection:
@@ -105,7 +105,7 @@ def init() -> None:
         c.commit()
         c.close()
         _WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
-        log.info("bug-fixer ready (enabled=%s)", _ENABLED)
+        log.info("bug-fixer ready (enabled=%s)", is_enabled())
     except Exception as e:
         log.warning("bugfix init failed: %s", e)
 
@@ -269,7 +269,7 @@ async def _spawn_fix(sig: str, examples: list[dict]) -> Optional[int]:
 async def detect_and_fix(force: bool = False) -> dict:
     """One detection pass. Returns a small report dict (also used by the API)."""
     global _active
-    if not _ENABLED and not force:
+    if not is_enabled() and not force:
         return {"enabled": False, "acted": False, "reason": "disabled"}
     if _active:
         return {"enabled": True, "acted": False, "reason": "a fix is already in flight"}
@@ -297,7 +297,7 @@ async def detect_and_fix(force: bool = False) -> dict:
 async def loop(interval: Optional[int] = None) -> None:
     """Background detector — call once at startup via asyncio.create_task."""
     iv = interval or _INTERVAL
-    log.info("bug-fixer loop every %ss (enabled=%s, min_occ=%s)", iv, _ENABLED, _MIN_OCCURRENCES)
+    log.info("bug-fixer loop every %ss (enabled=%s, min_occ=%s)", iv, is_enabled(), _MIN_OCCURRENCES)
     while True:
         try:
             await detect_and_fix()
