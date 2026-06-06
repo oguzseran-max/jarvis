@@ -12,6 +12,8 @@ so JARVIS gets smarter over time.
 
 import json
 import logging
+import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -93,9 +95,69 @@ def init_db():
 # Memories — facts JARVIS learns
 # ---------------------------------------------------------------------------
 
-def remember(content: str, mem_type: str = "fact", source: str = "", importance: int = 5) -> int:
-    """Store a memory. Returns the memory ID."""
+_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "to", "of", "and", "in", "on", "for",
+    "that", "this", "with", "his", "her", "their", "they", "you", "your", "user",
+    "le", "la", "les", "un", "une", "des", "de", "du", "et", "est", "son", "sa",
+    "ses", "que", "qui", "pour", "dans", "avec", "il", "elle", "tu", "ton", "ta",
+}
+
+
+def _tokens(text: str) -> set[str]:
+    """Lowercase content words (drop stopwords/short tokens) for similarity."""
+    words = re.findall(r"[a-zàâäéèêëïîôöùûüç0-9]+", (text or "").lower())
+    return {w for w in words if len(w) > 2 and w not in _STOPWORDS}
+
+
+def _similarity(a: str, b: str) -> float:
+    """Jaccard overlap of content words — cheap near-duplicate detector."""
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _find_similar(conn, content: str, threshold: float = 0.6):
+    """Return an existing memory row that says essentially the same thing, or None.
+    FTS narrows the candidates; Jaccard confirms it's a real duplicate."""
+    fts = _sanitize_fts_query(content)
+    if not fts:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT m.id, m.content, m.importance, m.access_count FROM memory_fts f "
+            "JOIN memories m ON f.rowid = m.id WHERE memory_fts MATCH ? "
+            "ORDER BY rank LIMIT 8", (fts,)).fetchall()
+    except Exception:
+        return None
+    best, best_sim = None, threshold
+    for r in rows:
+        sim = _similarity(content, r["content"])
+        if sim >= best_sim:
+            best, best_sim = r, sim
+    return best
+
+
+def remember(content: str, mem_type: str = "fact", source: str = "",
+             importance: int = 5, dedupe: bool = True) -> int:
+    """Store a memory. If a near-identical one already exists, REINFORCE it
+    (bump importance + access, refresh recency) instead of inserting a duplicate
+    — so a fact the user repeats gets stronger, not cloned. Returns the row id."""
+    content = (content or "").strip()
+    if not content:
+        return -1
     conn = _get_db()
+    if dedupe:
+        dup = _find_similar(conn, content)
+        if dup:
+            conn.execute(
+                "UPDATE memories SET importance = MAX(importance, ?), "
+                "access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+                (importance, time.time(), dup["id"]))
+            conn.commit()
+            conn.close()
+            log.info(f"Reinforced memory #{dup['id']} [{mem_type}]: {content[:50]}")
+            return dup["id"]
     cur = conn.execute(
         "INSERT INTO memories (type, content, source, importance, created_at) VALUES (?, ?, ?, ?, ?)",
         (mem_type, content, source, importance, time.time())
@@ -125,32 +187,69 @@ def _sanitize_fts_query(query: str) -> str:
 
 
 def recall(query: str, limit: int = 5) -> list[dict]:
-    """Search memories by relevance. Returns most relevant matches."""
-    fts_query = _sanitize_fts_query(query)
-    if not fts_query:
+    """Search memories by relevance — hybrid + ranked.
+
+    FTS5 finds lexical matches; a LIKE/token fallback catches paraphrases the
+    keyword index misses. Candidates are then re-scored by FTS rank +
+    importance + recency + how often they've been useful, so a durable
+    preference outranks a stale one-off even on a loose match. Fixes the old
+    "I repeat myself" behaviour where paraphrased facts never surfaced.
+    """
+    if len((query or "").strip()) < 3:
         return []
     conn = _get_db()
-    try:
-        results = conn.execute("""
-            SELECT m.id, m.type, m.content, m.importance, m.created_at, m.access_count
-            FROM memory_fts f
-            JOIN memories m ON f.rowid = m.id
-            WHERE memory_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-        """, (fts_query, limit)).fetchall()
-    except Exception:
-        results = []
+    cand: dict[int, dict] = {}
 
-    # Update access counts
-    for r in results:
-        conn.execute(
-            "UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE id = ?",
-            (time.time(), r["id"])
-        )
+    fts_query = _sanitize_fts_query(query)
+    if fts_query:
+        try:
+            for i, r in enumerate(conn.execute(
+                "SELECT m.id, m.type, m.content, m.importance, m.created_at, "
+                "m.last_accessed, m.access_count FROM memory_fts f "
+                "JOIN memories m ON f.rowid = m.id WHERE memory_fts MATCH ? "
+                "ORDER BY rank LIMIT 25", (fts_query,)).fetchall()):
+                d = dict(r)
+                d["_fts"] = 1.0 / (i + 1)  # 1st hit strongest
+                cand[d["id"]] = d
+        except Exception:
+            pass
+
+    # Token-overlap fallback over recent memories (paraphrase safety net).
+    qtok = _tokens(query)
+    if qtok:
+        for r in conn.execute(
+            "SELECT id, type, content, importance, created_at, last_accessed, "
+            "access_count FROM memories ORDER BY created_at DESC LIMIT 300").fetchall():
+            if r["id"] in cand:
+                continue
+            sim = len(qtok & _tokens(r["content"])) / max(1, len(qtok))
+            if sim >= 0.34:
+                d = dict(r)
+                d["_fts"] = sim * 0.8
+                cand[d["id"]] = d
+
+    if not cand:
+        conn.close()
+        return []
+
+    now = time.time()
+    def _score(d: dict) -> float:
+        age_days = max(0.0, (now - (d.get("created_at") or now)) / 86400)
+        recency = 1.0 / (1.0 + age_days / 30.0)        # ~half-life a month
+        importance = (d.get("importance") or 5) / 10.0
+        usefulness = min(1.0, (d.get("access_count") or 0) / 8.0)
+        return (d.get("_fts", 0) * 1.0 + importance * 0.8
+                + recency * 0.5 + usefulness * 0.4)
+
+    ranked = sorted(cand.values(), key=_score, reverse=True)[:limit]
+    for d in ranked:
+        conn.execute("UPDATE memories SET last_accessed = ?, "
+                     "access_count = access_count + 1 WHERE id = ?", (now, d["id"]))
     conn.commit()
     conn.close()
-    return [dict(r) for r in results]
+    for d in ranked:
+        d.pop("_fts", None)
+    return ranked
 
 
 def get_recent_memories(limit: int = 10) -> list[dict]:
@@ -316,13 +415,43 @@ def get_notes_by_topic(topic: str) -> list[dict]:
 # Context Builder — smart context for LLM calls
 # ---------------------------------------------------------------------------
 
-def build_memory_context(user_message: str) -> str:
-    """Build relevant context from memories, tasks, and notes for the LLM.
+def get_profile_facts(limit: int = 8) -> list[dict]:
+    """The stable 'what I know about you' set — durable preferences, people, and
+    project facts that should ALWAYS be in Marion's context regardless of the
+    current question. This is the core fix for repetition: facts the user
+    already gave never silently drop out just because the keywords don't match.
+    Ranked by importance, then how often they've proven useful, then recency.
+    """
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, type, content, importance, access_count, created_at "
+            "FROM memories WHERE type IN ('preference','person','project','decision') "
+            "OR importance >= 7 "
+            "ORDER BY importance DESC, access_count DESC, created_at DESC "
+            "LIMIT ?", (limit * 3,)).fetchall()
+    except Exception:
+        rows = []
+    conn.close()
+    # De-duplicate near-identical contents, keep the strongest.
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        if any(_similarity(d["content"], o["content"]) >= 0.6 for o in out):
+            continue
+        out.append(d)
+        if len(out) >= limit:
+            break
+    return out
 
-    Searches for relevant memories based on what the user is talking about.
-    Fast — runs FTS queries, no heavy computation.
+
+def build_memory_context(user_message: str) -> str:
+    """Assemble Marion's working memory for one turn: always-on user profile +
+    high-priority tasks + facts relevant to what's being said right now.
+    Fast — only local SQLite, no heavy computation.
     """
     parts = []
+    user_name = os.getenv("USER_NAME", "the user")
 
     # Always include: open high-priority tasks
     high_tasks = [t for t in get_open_tasks() if t["priority"] == "high"]
@@ -332,20 +461,21 @@ def build_memory_context(user_message: str) -> str:
                       for t in high_tasks[:5]]
         parts.append("HIGH PRIORITY TASKS:\n" + "\n".join(task_lines))
 
-    # Search memories relevant to what user is saying
-    if len(user_message) > 5:
-        relevant = recall(user_message, limit=3)
+    # ALWAYS-ON profile — durable facts so Marion never makes the user repeat.
+    profile = get_profile_facts(limit=8)
+    profile_contents = {p["content"] for p in profile}
+    if profile:
+        prof_lines = [f"  - [{p['type']}] {p['content']}" for p in profile]
+        parts.append(f"WHAT YOU KNOW ABOUT {user_name.upper()} (persistent — "
+                     f"don't ask again):\n" + "\n".join(prof_lines))
+
+    # Facts relevant to the current message (skip ones already in the profile).
+    if len((user_message or "").strip()) > 4:
+        relevant = [m for m in recall(user_message, limit=4)
+                    if m["content"] not in profile_contents]
         if relevant:
             mem_lines = [f"  - [{m['type']}] {m['content']}" for m in relevant]
-            parts.append("RELEVANT MEMORIES:\n" + "\n".join(mem_lines))
-
-    # Recent important memories (always available)
-    important = get_important_memories(limit=3)
-    if important:
-        imp_lines = [f"  - {m['content']}" for m in important
-                     if not any(m["content"] == r["content"] for r in (relevant if 'relevant' in dir() else []))]
-        if imp_lines:
-            parts.append("KEY FACTS:\n" + "\n".join(imp_lines[:3]))
+            parts.append("RELEVANT TO NOW:\n" + "\n".join(mem_lines))
 
     return "\n\n".join(parts) if parts else ""
 
@@ -416,11 +546,19 @@ async def extract_memories(user_text: str, jarvis_response: str, anthropic_clien
             model="claude-haiku-4-5-20251001",
             max_tokens=200,
             system=(
-                "Extract facts worth remembering from this conversation. "
-                "Only extract CONCRETE facts: preferences, decisions, names, dates, plans, goals. "
-                "NOT opinions, greetings, or casual chat. "
-                "Return JSON array of objects: [{\"type\": \"fact|preference|project|person|decision\", \"content\": \"...\", \"importance\": 1-10}] "
-                "Return [] if nothing worth remembering. Be very selective."
+                "You maintain Marion's long-term memory of her user. Extract only "
+                "DURABLE facts worth recalling weeks later: stable preferences, "
+                "people in the user's life, ongoing projects, decisions, goals, "
+                "recurring habits, important dates. IGNORE one-off requests, "
+                "greetings, small talk, and anything already obvious. "
+                "Write each fact in canonical third person, self-contained so it "
+                "makes sense with no context (e.g. 'User prefers replies in French', "
+                "'User's daughter is named Lea', 'User is building a trading bot "
+                "called Trader'). Importance: 8-10 = identity/strong preference, "
+                "5-7 = useful context, <5 = skip. "
+                "Return a JSON array: [{\"type\":\"fact|preference|project|person|decision\","
+                "\"content\":\"...\",\"importance\":1-10}] — or [] if nothing durable. "
+                "Be selective: 0-2 items is normal."
             ),
             messages=[{"role": "user", "content": f"User: {user_text}\nJARVIS: {jarvis_response}"}],
         )
