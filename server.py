@@ -64,6 +64,7 @@ import spotify_access
 import self_eval
 import perf_monitor
 import bug_fixer
+import self_formation
 import plejd_lights
 import doorbird
 
@@ -1996,6 +1997,11 @@ async def generate_response(
     if _prefs:
         system += _prefs
 
+    # Self-formation (Phase 3) — inject active guidance from her own perf review.
+    _guidance = self_formation.get_guidance_text(lang)
+    if _guidance:
+        system += _guidance
+
     # Self-awareness — remind JARVIS of last response to avoid repetition
     if last_response:
         system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
@@ -2278,6 +2284,8 @@ async def lifespan(application: FastAPI):
     if bug_fixer.is_enabled():
         asyncio.create_task(bug_fixer.loop())  # detect recurring bugs → draft fixes
         log.warning("bug-fixer AUTONOMOUS timer is ON (writes code unattended)")
+    self_formation.init()  # periodic self-assessment → learned guidance (Phase 3)
+    asyncio.create_task(self_formation.loop(lambda: anthropic_client))
     log.info("JARVIS server starting")
 
     # Monitor the DoorBird gate intercom: announce + describe visitors on a ring.
@@ -2521,6 +2529,38 @@ async def api_bugfix_dismiss(fix_id: int):
     """Discard a proposed fix (remove worktree + branch)."""
     try:
         return JSONResponse(await bug_fixer.dismiss(fix_id))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/formation/report")
+async def api_formation_report():
+    """Latest self-assessment + guidance rules (Phase 3) for the review panel."""
+    try:
+        return JSONResponse({"latest": self_formation.latest(),
+                             "history": self_formation.history(10)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/formation/run")
+async def api_formation_run():
+    """Force a self-assessment now (otherwise runs on a slow timer)."""
+    try:
+        return JSONResponse(await self_formation.run_assessment(anthropic_client, force=True))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/formation/guidance/{gid}/{action}")
+async def api_formation_guidance(gid: int, action: str):
+    """Activate (apply) / propose / remove a guidance rule. Human gate for the
+    behaviour changes Marion proposes about herself."""
+    status = {"activate": "active", "propose": "proposed", "remove": "removed"}.get(action)
+    if not status:
+        return JSONResponse({"error": "action must be activate|propose|remove"}, status_code=400)
+    try:
+        return JSONResponse(self_formation.set_guidance_status(gid, status))
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -4358,6 +4398,13 @@ async def voice_handler(ws: WebSocket):
                     _digest = self_eval.pop_due_digest(voice_state.get("lang", "en"))
                     if _digest:
                         response_text = f"{_digest} {response_text}"
+                except Exception:
+                    pass
+                # Phase 3: once-a-day spoken self-assessment summary.
+                try:
+                    _fd = self_formation.pop_due_digest(voice_state.get("lang", "en"))
+                    if _fd:
+                        response_text = f"{_fd} {response_text}"
                 except Exception:
                     pass
                 # Phase 0: time from end-of-transcription to here = classify +
