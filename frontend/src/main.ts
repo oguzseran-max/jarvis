@@ -15,6 +15,7 @@ import { createCornerHud } from "./hud";
 import { createSecurityHud } from "./security_hud";
 import { createPerfHud } from "./perf_hud";
 import { createBugfixHud } from "./bugfix_hud";
+import { createFormationHud } from "./formation_hud";
 import { createLearningHud } from "./learning_hud";
 import { createSurveillance } from "./surveillance";
 import { createAudioPlayer } from "./voice";
@@ -77,6 +78,7 @@ const cornerHud = createCornerHud(); // persistent 4-corner monitoring panels
 const securityHud = createSecurityHud(); // mid-left live WatchGuard threat panel
 const perfHud = createPerfHud(); // left-side live voice-loop telemetry (Phase 0)
 const bugfixHud = createBugfixHud(); // bottom-centre review panel for autonomous fixes (Phase 2)
+const formationHud = createFormationHud(); // right-side review panel for learned guidance (Phase 3)
 const learningHud = createLearningHud(); // mid-right live Self-Evolution panel
 const buildHud = createBuildHud(); // middle-right progress panel for background builds
 
@@ -488,6 +490,7 @@ bootMusic.addEventListener("timeupdate", () => {
   securityHud.reveal();
   perfHud.reveal();
   bugfixHud.reveal();
+  formationHud.reveal();
   learningHud.reveal();
     bootOverlay.classList.add("done");
     fadeMusicTo(AMBIENT_MUSIC_VOL, 2500);
@@ -506,6 +509,7 @@ function endBoot() {
   securityHud.reveal();
   perfHud.reveal();
   bugfixHud.reveal();
+  formationHud.reveal();
   learningHud.reveal();
   boot.fadeOut();
   bootOverlay.classList.add("done");
@@ -737,6 +741,7 @@ if (["rain", "storm", "clear", "clouds"].includes(decodeURIComponent(location.ha
   securityHud.reveal();
   perfHud.reveal();
   bugfixHud.reveal();
+  formationHud.reveal();
   learningHud.reveal();
   setLanguage("fr");         // show Marion (with her weather accessory)
   // weather.start() (above) reads the hash and stages the effect.
