@@ -63,6 +63,9 @@ const CSS = `
 .bf-btn.no:hover { background: rgba(${RED},0.16); }
 .bf-btn[disabled] { opacity: 0.5; cursor: default; }
 .bf-busy { font-size: 10px; color: rgba(${C},0.7); letter-spacing: 1px; padding: 4px 0; }
+.bf-err { margin-top: 8px; font-size: 10px; line-height: 1.45; color: rgba(${RED},1);
+  background: rgba(${RED},0.08); border: 1px solid rgba(${RED},0.3); border-radius: 5px;
+  padding: 7px 9px; white-space: pre-wrap; }
 `;
 
 export interface BugfixHud { reveal(): void; destroy(): void; }
@@ -91,16 +94,22 @@ export function createBugfixHud(): BugfixHud {
   let stopped = false;
   let revealed = false;
   let busy = new Set<number>();   // ids mid-action, so we don't double-submit
+  const errors = new Map<number, string>();  // last action error per fix id
 
   async function act(id: number, what: "approve" | "dismiss") {
     if (busy.has(id)) return;
     busy.add(id);
+    errors.delete(id);
     render(lastFixes); // re-render to disable buttons
     try {
-      await fetch(`/api/bugfix/${id}/${what}`, { method: "POST" });
-    } catch { /* surfaced on next poll */ }
+      const r = await fetch(`/api/bugfix/${id}/${what}`, { method: "POST" });
+      const body = await r.json().catch(() => ({}));
+      if (body && body.ok === false && body.error) errors.set(id, String(body.error));
+    } catch (e) {
+      errors.set(id, String(e));
+    }
     busy.delete(id);
-    poll(); // immediate refresh
+    poll(); // immediate refresh (success removes the card; failure keeps it + error)
   }
 
   async function toggleDiff(id: number, box: HTMLElement) {
@@ -157,7 +166,8 @@ export function createBugfixHud(): BugfixHud {
           <button class="bf-btn" data-act="diff" ${disabled}>Voir le diff</button>
           <button class="bf-btn ok" data-act="approve" ${disabled}>✓ Valider</button>
           <button class="bf-btn no" data-act="dismiss" ${disabled}>✗ Rejeter</button>
-        </div>${busy.has(f.id) ? '<div class="bf-busy">traitement…</div>' : ""}`;
+        </div>${busy.has(f.id) ? '<div class="bf-busy">traitement…</div>' : ""}`
+        + (errors.has(f.id) ? `<div class="bf-err">⚠ ${escapeHtml(errors.get(f.id)!)}</div>` : "");
       const diffBox = card.querySelector(`#bf-diff-${f.id}`) as HTMLElement;
       card.querySelector('[data-act="diff"]')!.addEventListener("click", () => toggleDiff(f.id, diffBox));
       card.querySelector('[data-act="approve"]')!.addEventListener("click", () => act(f.id, "approve"));
