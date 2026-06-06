@@ -21,12 +21,17 @@ interface Report {
 
 const CSS = `
 #formation-hud {
-  position: fixed; right: 18px; top: 340px; width: 286px; max-width: 90vw; z-index: 5;
+  position: fixed; right: 18px; top: 340px; width: 224px; max-width: 90vw; z-index: 5;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   opacity: 0; pointer-events: none; transition: opacity 0.45s ease;
 }
 #formation-hud.show { opacity: 1; pointer-events: auto; }
-.fm-frame { padding: 13px 14px;
+/* Compact scrolling dial: content scrolls inside a small fixed-height window. */
+.fm-scroll { max-height: 190px; overflow-y: auto; margin-top: 2px;
+  scrollbar-width: thin; scrollbar-color: rgba(${VIOLET},0.45) transparent; }
+.fm-scroll::-webkit-scrollbar { width: 5px; }
+.fm-scroll::-webkit-scrollbar-thumb { background: rgba(${VIOLET},0.4); border-radius: 3px; }
+.fm-frame { padding: 11px 12px;
   background: linear-gradient(180deg, rgba(10,16,28,0.92), rgba(10,16,28,0.8));
   border: 1px solid rgba(${VIOLET}, 0.32); border-left: 3px solid rgba(${VIOLET},1);
   border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,0.5); }
@@ -120,10 +125,12 @@ export function createFormationHud(): FormationHud {
     const summary = rep.latest?.assessment?.summary || "";
     el.innerHTML = `<div class="fm-frame">
       <div class="fm-head"><span class="spark"></span><span>Auto-évaluation</span></div>
-      ${summary ? `<div class="fm-assess">« ${esc(summary)} »</div>` : ""}
-      <div class="fm-sect">Guidance proposée (${proposed.length})</div>
-      ${proposed.map(ruleCard).join("")}
-      ${active.length ? `<div class="fm-sect">Active (${active.length})</div>` + active.map(ruleCard).join("") : ""}
+      <div class="fm-scroll">
+        ${summary ? `<div class="fm-assess">« ${esc(summary)} »</div>` : ""}
+        <div class="fm-sect">Guidance proposée (${proposed.length})</div>
+        ${proposed.map(ruleCard).join("")}
+        ${active.length ? `<div class="fm-sect">Active (${active.length})</div>` + active.map(ruleCard).join("") : ""}
+      </div>
     </div>`;
     el.querySelectorAll<HTMLButtonElement>(".fm-btn[data-id]").forEach((b) => {
       b.addEventListener("click", () =>

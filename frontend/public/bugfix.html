@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>J.A.R.V.I.S // Correctifs autonomes</title>
+<style>
+  :root{
+    --bg:#03070d; --panel:rgba(8,20,32,.72); --line:rgba(0,229,192,.18);
+    --teal:#00e5c0; --cyan:#39c6ff; --txt:#bfe9e4; --dim:#5d7e84;
+    --amber:#ffb020; --red:#ff3b5c; --green:#3cdc82;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;min-height:100%}
+  body{
+    background:
+      radial-gradient(1200px 700px at 50% -10%, rgba(0,120,120,.10), transparent 60%),
+      repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.18) 2px 3px),
+      linear-gradient(160deg,#03070d,#04101a);
+    color:var(--txt); font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+    padding:24px 28px 60px;
+  }
+  .wrap{max-width:1000px;margin:0 auto}
+  header{display:flex;align-items:flex-end;justify-content:space-between;
+    border-bottom:1px solid var(--line);padding-bottom:14px;gap:20px;flex-wrap:wrap}
+  h1{margin:0;font-size:20px;letter-spacing:.3em;font-weight:600;color:#eafffb;
+    text-shadow:0 0 18px rgba(0,229,192,.5)}
+  h1 b{color:var(--teal)}
+  .sub{color:var(--dim);font-size:12px;letter-spacing:.16em;margin-top:6px}
+  .chips{display:flex;gap:10px;flex-wrap:wrap}
+  .chip{border:1px solid var(--line);border-radius:3px;padding:7px 12px;background:var(--panel);
+    font-size:11px;letter-spacing:.12em;text-align:center}
+  .chip .n{display:block;font-size:20px;font-weight:700;margin-top:2px}
+  .chip.ready .n{color:var(--amber)} .chip.ok .n{color:var(--green)} .chip.all .n{color:var(--cyan)}
+  .empty{color:var(--dim);font-size:13px;letter-spacing:.1em;margin-top:40px;text-align:center;line-height:2}
+  .card{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:16px 18px;border-left:3px solid var(--dim)}
+  .card.ready{border-left-color:var(--amber);border-color:rgba(255,176,32,.3)}
+  .card.approved{border-left-color:var(--green)} .card.dismissed,.card.nofix{opacity:.6}
+  .card.error{border-left-color:var(--red)} .card.analyzing{border-left-color:var(--cyan)}
+  .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+  .sig{font-size:15px;color:#eafffb;font-weight:600}
+  .badge{padding:3px 9px;border-radius:3px;font-size:10px;letter-spacing:.1em;border:1px solid;text-transform:uppercase}
+  .b-ready{color:var(--amber);border-color:var(--amber)} .b-approved{color:var(--green);border-color:var(--green)}
+  .b-error{color:var(--red);border-color:var(--red)} .b-other{color:var(--dim);border-color:var(--dim)}
+  .b-analyzing{color:var(--cyan);border-color:var(--cyan)}
+  .occ{margin-left:auto;color:var(--dim);font-size:11px}
+  .sum{font-size:12.5px;line-height:1.6;color:var(--txt);white-space:pre-wrap;margin:6px 0 10px}
+  .stat{font-size:11px;color:var(--dim);white-space:pre-wrap;border-left:2px solid rgba(0,229,192,.25);
+    padding-left:10px;margin-bottom:10px}
+  .err{font-size:11px;color:var(--red);background:rgba(255,59,92,.08);border:1px solid rgba(255,59,92,.3);
+    border-radius:5px;padding:8px 10px;margin-bottom:10px;white-space:pre-wrap}
+  .diff{display:none;max-height:420px;overflow:auto;background:rgba(0,0,0,.5);border:1px solid var(--line);
+    border-radius:6px;padding:11px 13px;font-size:11px;line-height:1.5;white-space:pre;margin-bottom:11px;color:rgba(0,229,192,.85)}
+  .diff.on{display:block}
+  .diff .add{color:var(--green)} .diff .del{color:var(--red)} .diff .hd{color:var(--amber)}
+  .acts{display:flex;gap:9px;flex-wrap:wrap}
+  .btn{cursor:pointer;font:inherit;font-size:12px;letter-spacing:.08em;padding:9px 16px;border-radius:6px;
+    text-transform:uppercase;transition:.15s;border:1px solid var(--line);background:rgba(0,229,192,.06);color:rgba(0,229,192,.9)}
+  .btn:hover{border-color:var(--teal)}
+  .btn.ok{color:var(--green);border-color:rgba(60,220,130,.45);background:rgba(60,220,130,.08)}
+  .btn.ok:hover{background:rgba(60,220,130,.18)}
+  .btn.no{color:var(--red);border-color:rgba(255,59,92,.4);background:rgba(255,59,92,.07)}
+  .btn.no:hover{background:rgba(255,59,92,.16)}
+  .btn[disabled]{opacity:.5;cursor:default}
+  .foot{margin-top:26px;color:var(--dim);font-size:10.5px;letter-spacing:.12em;line-height:1.8;
+    border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>J<b>.</b>A<b>.</b>R<b>.</b>V<b>.</b>I<b>.</b>S <b>//</b> CORRECTIFS&nbsp;AUTONOMES</h1>
+      <div class="sub" id="sub">Correctifs rédigés par Marion — à valider ou rejeter</div>
+    </div>
+    <div class="chips" id="chips"></div>
+  </header>
+  <div id="list"></div>
+  <div class="foot" id="foot">▸ La fusion (Valider) est la seule action qui touche le code. Rien n'est fusionné sans ton clic.</div>
+</div>
+
+<script>
+const RS = {ready:"b-ready",approved:"b-approved",error:"b-error",analyzing:"b-analyzing"};
+const busy = new Set();
+const errs = new Map();
+
+function esc(s){return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function colorize(d){return esc(d).split("\n").map(l=>{
+  if(l.startsWith("+")&&!l.startsWith("+++"))return `<span class="add">${l}</span>`;
+  if(l.startsWith("-")&&!l.startsWith("---"))return `<span class="del">${l}</span>`;
+  if(l.startsWith("@@")||l.startsWith("diff "))return `<span class="hd">${l}</span>`;
+  return l;}).join("\n");}
+
+async function act(id, what){
+  if(busy.has(id))return; busy.add(id); errs.delete(id); draw(LAST);
+  try{
+    const r = await fetch(`/api/bugfix/${id}/${what}`,{method:"POST"});
+    const b = await r.json().catch(()=>({}));
+    if(b && b.ok===false && b.error) errs.set(id, String(b.error));
+  }catch(e){ errs.set(id, String(e)); }
+  busy.delete(id); poll();
+}
+async function toggleDiff(id, box){
+  if(box.classList.contains("on")){box.classList.remove("on");return;}
+  box.classList.add("on");
+  if(box.dataset.loaded)return;
+  box.textContent="chargement du diff…";
+  try{ const d=(await (await fetch(`/api/bugfix/${id}/diff`)).json()).diff||"(diff vide)";
+    box.innerHTML=colorize(d); box.dataset.loaded="1"; }
+  catch{ box.textContent="diff indisponible"; }
+}
+
+let LAST=[];
+function draw(fixes){
+  LAST=fixes;
+  const ready=fixes.filter(f=>f.status==="ready").length;
+  const approved=fixes.filter(f=>f.status==="approved").length;
+  document.getElementById("chips").innerHTML=
+    `<div class="chip all">TOTAL<span class="n">${fixes.length}</span></div>`+
+    `<div class="chip ready">À VALIDER<span class="n">${ready}</span></div>`+
+    `<div class="chip ok">VALIDÉS<span class="n">${approved}</span></div>`;
+  const list=document.getElementById("list");
+  if(!fixes.length){ list.innerHTML=`<div class="empty">✓ Aucun correctif pour l'instant.<br>`+
+    `Marion en rédige un quand un bug récurrent est détecté.</div>`; return; }
+  list.innerHTML="";
+  for(const f of fixes){
+    const dis=busy.has(f.id)?"disabled":"";
+    const card=document.createElement("div");
+    card.className="card "+f.status;
+    const badge=RS[f.status]||"b-other";
+    card.innerHTML=`
+      <div class="chead">
+        <span class="sig">${esc(f.signature)}</span>
+        <span class="badge ${badge}">${f.status}</span>
+        <span class="occ">×${f.occurrences} occurrences</span>
+      </div>
+      ${f.summary?`<div class="sum">${esc(f.summary)}</div>`:""}
+      ${f.diffstat?`<div class="stat">${esc(f.diffstat)}</div>`:""}
+      ${f.error?`<div class="err">⚠ ${esc(f.error)}</div>`:""}
+      ${errs.has(f.id)?`<div class="err">⚠ ${esc(errs.get(f.id))}</div>`:""}
+      <div class="diff" id="d-${f.id}"></div>
+      <div class="acts">
+        <button class="btn" data-a="diff" ${dis}>Voir le diff</button>
+        ${f.status==="ready"?`<button class="btn ok" data-a="approve" ${dis}>✓ Valider (fusionner)</button>
+          <button class="btn no" data-a="dismiss" ${dis}>✗ Rejeter</button>`:""}
+      </div>`;
+    const box=card.querySelector(`#d-${f.id}`);
+    card.querySelector('[data-a="diff"]').addEventListener("click",()=>toggleDiff(f.id,box));
+    const ap=card.querySelector('[data-a="approve"]'); if(ap)ap.addEventListener("click",()=>act(f.id,"approve"));
+    const dm=card.querySelector('[data-a="dismiss"]'); if(dm)dm.addEventListener("click",()=>act(f.id,"dismiss"));
+    list.appendChild(card);
+  }
+}
+
+async function poll(){
+  try{ const r=await fetch("/api/bugfix/list",{cache:"no-store"});
+    if(r.ok) draw((await r.json()).fixes||[]); }
+  catch{ document.getElementById("sub").textContent="backend hors ligne…"; }
+}
+poll();
+setInterval(poll, 6000);
+</script>
+</body>
+</html>
