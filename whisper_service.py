@@ -29,6 +29,13 @@ from faster_whisper.audio import decode_audio
 MODEL_SIZE = os.getenv("WHISPER_MODEL", "small")
 PORT = int(os.getenv("WHISPER_PORT", "8765"))
 ALLOWED = {l.strip() for l in os.getenv("WHISPER_LANGS", "en,fr,tr").split(",") if l.strip()}
+# Decode beam width. Beam search runs the decoder ~BEAM_SIZE times per step, so on
+# a CPU int8 model it is the dominant transcription cost and scales with utterance
+# length — the recurring "slow transcription" flag. Default to greedy decoding (1),
+# which roughly halves latency; the decoder is already primed with in-domain vocab
+# and downstream speech-correction catches the rare extra mishear. Raise via
+# WHISPER_BEAM_SIZE (e.g. 5) to trade latency back for accuracy.
+BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1")))
 
 print(f"[whisper] loading model '{MODEL_SIZE}' …", flush=True)
 model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
@@ -44,32 +51,54 @@ _PRIMERS = {
     "tr": "Türkçe sohbet. Marion, müzik, Spotify, ışıklar, kapı, hava durumu.",
 }
 
-# self_eval.py writes learned proper nouns here; we merge them into the primer
-# live (re-read only when the file changes), so Marion stops mis-hearing words
-# the user has corrected — without restarting this service.
+# Two data-driven vocab layers are merged into the primer live (each re-read only
+# when its file changes, so no restart is needed):
+#   • whisper_vocab_<lang>.txt — proper nouns self_eval.py learns from the user's
+#     corrections (so Marion stops mis-hearing words he's corrected).
+#   • music_vocab_<lang>.txt    — artist / band / song names (a curated seed plus
+#     whatever tools/sync_music_vocab.py pulls from his Spotify) so music requests
+#     are transcribed right the first time. Also primes English (no base primer).
 _VOCAB_DIR = Path(__file__).resolve().parent / "data"
-_vocab_cache: dict = {}  # lang -> (mtime, "word, word, ...")
+_vocab_cache: dict = {}  # (lang, kind) -> (mtime, "word, word, ...")
+
+
+def _read_vocab(lang, kind, limit=None):
+    """Read data/<kind>_<lang>.txt, re-reading only when the file changes.
+
+    Entries may be comma-separated and/or one per line — both normalise to a
+    single ", "-joined primer string, so the curated seed files stay readable.
+    `limit` caps how many entries are kept (the primer must stay short or Whisper
+    starts echoing it back on silence).
+    """
+    try:
+        path = _VOCAB_DIR / f"{kind}_{lang}.txt"
+        mtime = path.stat().st_mtime
+        key = (lang, kind, limit)
+        cached = _vocab_cache.get(key)
+        if not cached or cached[0] != mtime:
+            raw = path.read_text()
+            parts = [p.strip() for line in raw.splitlines() for p in line.split(",")]
+            parts = [p for p in parts if p and not p.startswith("#")]
+            if limit:
+                parts = parts[:limit]
+            text = ", ".join(parts)
+            _vocab_cache[key] = (mtime, text)
+            return text
+        return cached[1]
+    except Exception:
+        return ""
 
 
 def _primer_for(lang):
     base = _PRIMERS.get(lang)
     if not lang:
         return base
-    try:
-        path = _VOCAB_DIR / f"whisper_vocab_{lang}.txt"
-        mtime = path.stat().st_mtime
-        cached = _vocab_cache.get(lang)
-        if not cached or cached[0] != mtime:
-            learned = path.read_text().strip()
-            _vocab_cache[lang] = (mtime, learned)
-        else:
-            learned = cached[1]
-    except Exception:
-        learned = ""
-    if learned:
-        return f"{base or ''} {learned}".strip()
+    extras = [v for v in (_read_vocab(lang, "whisper_vocab"),
+                          _read_vocab(lang, "music_vocab", limit=35)) if v]
+    if extras:
+        return f"{base or ''} {', '.join(extras)}".strip()
     return base
-print(f"[whisper] ready on :{PORT}  langs={sorted(ALLOWED)}", flush=True)
+print(f"[whisper] ready on :{PORT}  langs={sorted(ALLOWED)}  beam={BEAM_SIZE}", flush=True)
 
 # Whisper hallucinates these training-data artifacts on silence/noise/music —
 # discard any transcript that's essentially one of them so JARVIS never "replies"
@@ -139,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
                 audio = audio * min(0.95 / peak, 10.0)
                 with _lock:
                     segments, info = model.transcribe(
-                        audio, language=forced, beam_size=5,
+                        audio, language=forced, beam_size=BEAM_SIZE,
                         vad_filter=True,
                         no_speech_threshold=0.6,
                         compression_ratio_threshold=2.2,
@@ -150,7 +179,20 @@ class Handler(BaseHTTPRequestHandler):
                         # words self_eval has learned from the user's corrections.
                         initial_prompt=_primer_for(forced),
                     )
-                    text = " ".join(s.text.strip() for s in segments).strip()
+                    # Drop low-confidence segments: when music plays on an external
+                    # speaker the mic catches it and Whisper "hears voices" (garbled
+                    # lyrics). Real speech sits well above -1.1 avg_logprob; gibberish
+                    # from music/noise falls below it. Conservative so it won't eat
+                    # genuine quiet speech.
+                    kept = []
+                    for sg in segments:
+                        lp = getattr(sg, "avg_logprob", 0.0)
+                        nsp = getattr(sg, "no_speech_prob", 0.0)
+                        if lp < -1.1 or nsp > 0.7:
+                            print(f"[whisper] drop seg lp={lp:.2f} nsp={nsp:.2f} {sg.text.strip()!r}", flush=True)
+                            continue
+                        kept.append(sg.text.strip())
+                    text = " ".join(kept).strip()
                 lang = forced or (info.language if info.language in ALLOWED else "en")
                 if _is_hallucination(text):
                     text = ""
@@ -158,6 +200,8 @@ class Handler(BaseHTTPRequestHandler):
                 detected = info.language
             else:
                 prob, detected = 0.0, "silence"
+            if text:
+                print(f"[whisper] ({lang}) {text!r}", flush=True)
             self._json(200, {
                 "text": text,
                 "language": lang,
