@@ -34,17 +34,17 @@ ALLOWED = {l.strip() for l in os.getenv("WHISPER_LANGS", "en,fr,tr").split(",") 
 # length — the recurring "slow transcription" flag. Default to greedy decoding (1),
 # which roughly halves latency; the decoder is already primed with in-domain vocab
 # and downstream speech-correction catches the rare extra mishear. Raise via
-# WHISPER_BEAM_SIZE (e.g. 5) to trade latency back for accuracy.
+# WHISPER_BEAM_SIZE (e.g. 5) to trade latency back for accuracy. max(1, …) guards
+# against a misconfigured 0/negative value being handed to the decoder.
 BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1")))
 
-# Decoding cost knobs (the voice loop is latency-bound — see perf_monitor "slow
-# transcription" flags). beam_size=5 runs the decoder 5× per step; on a CPU int8
-# model that dominates a multi-second utterance. Greedy decoding (beam_size=1) is
-# the standard real-time setting and, with VAD + the in-domain primer, costs
-# almost nothing in accuracy on short conversational speech. Both overridable.
-BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
-# ctranslate2 defaults to only 4 CPU threads regardless of cores; let it use them.
-CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", str(os.cpu_count() or 4)))
+# CPU thread count. ctranslate2 defaults to only 4 threads, so giving it the full
+# core count helps — UP TO A POINT. Past ~8 threads an int8 model oversubscribes
+# (cache thrash + contention with the server/TTS/browser sharing this machine) and
+# transcription can run SLOWER than real-time — the pathological "slow transcription"
+# tail (a sub-18s clip measured at 29s). Cap the default at 8; low-core machines are
+# unaffected, and WHISPER_CPU_THREADS still overrides explicitly.
+CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", str(min(os.cpu_count() or 4, 8))))
 
 print(f"[whisper] loading model '{MODEL_SIZE}' (beam={BEAM_SIZE}, threads={CPU_THREADS}) …", flush=True)
 model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
@@ -182,6 +182,11 @@ class Handler(BaseHTTPRequestHandler):
                         no_speech_threshold=0.6,
                         compression_ratio_threshold=2.2,
                         condition_on_previous_text=False,
+                        # We only ever join sg.text — never the per-segment
+                        # timestamps. Telling the decoder not to predict timestamp
+                        # tokens drops tokens-per-segment, trimming decode time on
+                        # every utterance at zero cost to the transcript.
+                        without_timestamps=True,
                         # Prime the decoder with in-domain French/Turkish words so
                         # proper nouns and household vocabulary are recognised
                         # correctly (costs ~nothing, improves accuracy). Includes
