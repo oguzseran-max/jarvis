@@ -37,8 +37,17 @@ ALLOWED = {l.strip() for l in os.getenv("WHISPER_LANGS", "en,fr,tr").split(",") 
 # WHISPER_BEAM_SIZE (e.g. 5) to trade latency back for accuracy.
 BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1")))
 
-print(f"[whisper] loading model '{MODEL_SIZE}' …", flush=True)
-model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+# Decoding cost knobs (the voice loop is latency-bound — see perf_monitor "slow
+# transcription" flags). beam_size=5 runs the decoder 5× per step; on a CPU int8
+# model that dominates a multi-second utterance. Greedy decoding (beam_size=1) is
+# the standard real-time setting and, with VAD + the in-domain primer, costs
+# almost nothing in accuracy on short conversational speech. Both overridable.
+BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+# ctranslate2 defaults to only 4 CPU threads regardless of cores; let it use them.
+CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", str(os.cpu_count() or 4)))
+
+print(f"[whisper] loading model '{MODEL_SIZE}' (beam={BEAM_SIZE}, threads={CPU_THREADS}) …", flush=True)
+model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
 _lock = threading.Lock()  # faster-whisper isn't meant for concurrent calls
 
 # Per-language decoder primers — short, in-domain vocabulary that nudges Whisper
