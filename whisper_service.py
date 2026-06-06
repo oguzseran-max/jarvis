@@ -85,13 +85,14 @@ _PRIMERS = {
     # Kept to ~2 sentences so Whisper doesn't echo it back on silence. Words the
     # user explicitly corrects are added on top of this by self_eval (the
     # whisper_vocab_fr.txt layer), so this only needs the stable household core.
-    "fr": ("Conversation familière en français avec Marion, à Veigy-Foncenex, "
-           "en Haute-Savoie près de Genève. "
-           "mon amour, Leyla, Aylin, Oz, Spotify, Phil Collins, la musique, "
-           "le salon, la mezzanine, la cuisine, le portail, la voiture, "
-           "les lumières, la météo, la surveillance. "
-           "mets-toi en bikini, mets ta tenue de pluie, ta tenue normale, "
-           "suis la météo, ouvre le portail, allume les lumières."),
+    # MUST stay short — Whisper's initial_prompt caps near ~224 tokens and a long
+    # primer wrecks decoding (Marion "stopped understanding" when this ballooned).
+    # Command verbs (allume, mets, joue, tamise) are plain French Whisper knows;
+    # only the household proper nouns need priming, and most live in the vocab
+    # layer (capped below), so the base stays to a single line.
+    "fr": ("Conversation familière en français avec Marion, à Veigy-Foncenex "
+           "près de Genève. mon amour, Leyla, Aylin, Oz, Spotify, la musique, "
+           "les lumières, le salon, la mezzanine, la cuisine, le portail, la météo."),
     "tr": "Türkçe sohbet. Marion, müzik, Spotify, ışıklar, kapı, hava durumu.",
 }
 
@@ -137,8 +138,10 @@ def _primer_for(lang):
     base = _PRIMERS.get(lang)
     if not lang:
         return base
-    extras = [v for v in (_read_vocab(lang, "whisper_vocab"),
-                          _read_vocab(lang, "music_vocab", limit=35)) if v]
+    # Cap BOTH learned layers: the primer must stay short or Whisper degrades /
+    # echoes. whisper_vocab grows with every correction, so bound it too.
+    extras = [v for v in (_read_vocab(lang, "whisper_vocab", limit=20),
+                          _read_vocab(lang, "music_vocab", limit=25)) if v]
     if extras:
         return f"{base or ''} {', '.join(extras)}".strip()
     return base
