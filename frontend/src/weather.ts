@@ -195,7 +195,11 @@ export function createWeather(onLook: (look: string) => void) {
     } catch { /* ignore */ }
   }
 
+  // Manual override (e.g. the voice command "mets-toi en bikini"). While set, it
+  // wins over real weather and pauses polling — until cleared by auto().
+  let override: string | null = null;
   const _forced = () => {
+    if (override) return override;
     const f = decodeURIComponent(location.hash.replace("#", "")).trim();
     return ["rain", "storm", "clear", "clouds"].includes(f) ? f : null;
   };
@@ -208,13 +212,20 @@ export function createWeather(onLook: (look: string) => void) {
         apply(f);
       } else {
         poll();
-        setInterval(() => { if (!_forced()) poll(); }, 10 * 60 * 1000);
       }
+      // Poll often (90s) so a real sky change is reflected live, without a reload.
+      // The backend lazily re-fetches the sky so this stays fresh, not hourly.
+      setInterval(() => { if (!_forced()) poll(); }, 90 * 1000);
       addEventListener("hashchange", () => {
         const ff = _forced();
         if (ff) apply(ff); else poll();
       });
     },
+    // Force a look on demand (voice command). condition is a weather word, so it
+    // reuses the same FX + outfit mapping as real weather.
+    force(condition: string) { override = condition; apply(condition); },
+    // Resume weather-driven outfit.
+    auto() { override = null; poll(); },
     _apply: apply,
   };
 }

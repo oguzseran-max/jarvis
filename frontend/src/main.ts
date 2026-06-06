@@ -414,6 +414,13 @@ socket.onMessage((msg) => {
   } else if (type === "watch_mode") {
     // Backend toggled surveillance (voice command).
     if (msg.on) surveillance.start(); else surveillance.stop();
+  } else if (type === "set_look") {
+    // Voice command ("mets-toi en bikini" / "tenue de pluie" / "suis la météo").
+    // Change Marion's outfit live — no reload. A manual look overrides the
+    // weather (via weather.force, which pauses polling) until "auto" resumes it.
+    const look = msg.look as string;
+    if (look === "auto") weather.auto();
+    else weather.force(look === "sun" ? "clear" : look === "rain" ? "rain" : "clouds");
   }
 });
 

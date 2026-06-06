@@ -229,6 +229,7 @@ When you decide the user needs something DONE (not just discussed), include an a
 - [ACTION:NEWS] — ONLY for a DEEPER news dive on something your WORLD NEWS context doesn't already cover. Normal news/geopolitics/AI/tech/Geneva/Istanbul questions you answer INSTANTLY from context (no tag, no "let me check"). When you do use it, put the question after the tag, e.g. "[ACTION:NEWS] latest on the situation in the Middle East".
 - [ACTION:MUSIC] query — play music on the Spotify speakers. Put the artist / song / album / playlist after the tag, or `pause` / `next` / `resume`. Examples: "mets Dua Lipa" → "[ACTION:MUSIC] Dua Lipa" ; "joue du Stromae" → "[ACTION:MUSIC] Stromae" ; "chanson suivante" → "[ACTION:MUSIC] next" ; "mets pause" → "[ACTION:MUSIC] pause". The transcription often garbles the verb ("Medoua Lipa", "et Dua Lipa") — recover the artist/song name and emit the tag anyway. ALWAYS give a SHORT spoken confirmation BEFORE the tag (e.g. "Tout de suite, mon amour. [ACTION:MUSIC] Dua Lipa"). NEVER describe the artist instead of playing — naming music means he wants to hear it.
 - [ACTION:WEATHER] place — precise live weather for ANY city, region or country worldwide. Use whenever the user asks the weather somewhere OTHER than home: "what's the weather in Tokyo", "quel temps fait-il à Paris", "is it raining in London". Put ONLY the place name after the tag, e.g. "[ACTION:WEATHER] Tokyo". Give a short spoken lead-in BEFORE the tag (e.g. "One moment, sir. [ACTION:WEATHER] Tokyo") — the precise figures are spoken automatically once fetched, so do NOT invent temperatures yourself. For the LOCAL/home weather you already have, answer inline without this tag.
+- [ACTION:OUTFIT] sun|rain|default|auto — change YOUR OWN outfit/look on demand (the avatar Marion wears). Use when the user tells you to change clothes/look: "mets-toi en bikini"/"put on your bikini"/"tenue d'été" → sun; "mets ta tenue de pluie"/"prends ton parapluie"/"rain gear" → rain; "tenue normale"/"habille-toi normalement"/"default look" → default; "suis la météo"/"follow the weather"/"back to automatic" → auto (resume weather-driven outfit). Put ONLY the keyword after the tag, e.g. "[ACTION:OUTFIT] sun". A manual look overrides the weather until you're told auto.
 - [ACTION:BUILD] description — when user wants a project built. Claude Code does the work.
 - [ACTION:BROWSE] url or search query — when user wants to see a webpage or search result in Chrome
 - [ACTION:RESEARCH] detailed research brief — when user wants real research with real data. Claude Code will browse the web, find real listings/data, and create a report document. Give it a detailed brief of what to find.
@@ -383,9 +384,10 @@ def _fetch_weather_string_sync() -> Optional[str]:
         temp = current.get("temperature_2m")
         if temp is None:
             return None
-        global _cached_weather_code, _cached_precip
+        global _cached_weather_code, _cached_precip, _weather_code_at
         _cached_weather_code = current.get("weathercode")
         _cached_precip = current.get("precipitation")
+        _weather_code_at = time.time()
         return f"Current weather in {location['label']}: {temp}{unit_symbol}"
     except Exception as e:
         log.debug(f"Weather fetch failed: {e}")
@@ -394,6 +396,12 @@ def _fetch_weather_string_sync() -> Optional[str]:
 
 _cached_weather_code: Optional[int] = None
 _cached_precip: Optional[float] = None
+# Freshness of the weather CODE (drives Marion's outfit). The full context refresh
+# is hourly; this lets /api/weather lazily re-fetch the sky more often so the
+# outfit follows real changes within minutes, not an hour.
+_weather_code_at: float = 0.0
+_weather_refreshing: bool = False
+_WEATHER_CODE_TTL_SECONDS = 8 * 60
 
 
 def _weather_condition() -> str:
@@ -1104,7 +1112,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CAMERA|SENTIMENT|NEWS|WEATHER|MUSIC|LIGHTS|GATE)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CAMERA|SENTIMENT|NEWS|WEATHER|MUSIC|LIGHTS|GATE|OUTFIT)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -2684,7 +2692,24 @@ async def api_doorbird_video():
 
 @app.get("/api/weather")
 async def api_weather():
-    """Current weather condition for the UI's weather effects (rain/sun)."""
+    """Current weather condition for the UI's weather effects (rain/sun).
+
+    Lazily re-fetches the sky in the background when the cached code is older
+    than the TTL, so Marion's outfit follows real weather changes within
+    minutes (the frontend polls this) instead of waiting for the hourly refresh.
+    """
+    global _weather_refreshing
+    if (not _weather_refreshing
+            and (time.time() - _weather_code_at) > _WEATHER_CODE_TTL_SECONDS):
+        _weather_refreshing = True
+
+        async def _bg_refresh():
+            global _weather_refreshing
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, _fetch_weather_string_sync)
+            finally:
+                _weather_refreshing = False
+        asyncio.create_task(_bg_refresh())
     return {"condition": _weather_condition(), "code": _cached_weather_code,
             "text": _ctx_cache.get("weather", "")}
 
@@ -4233,6 +4258,9 @@ async def voice_handler(ws: WebSocket):
                                     elif action_type == "research":
                                         response_text = {"fr": "Je me renseigne, mon amour.",
                                                          "tr": "Araştırıyorum, canım."}.get(_lg, "Looking into that now, sir.")
+                                    elif action_type == "outfit":
+                                        response_text = {"fr": "Voilà, mon amour.",
+                                                         "tr": "İşte, canım."}.get(_lg, "There we are, sir.")
                                     else:
                                         response_text = {"fr": "Tout de suite, mon amour.",
                                                          "tr": "Hemen, canım."}.get(_lg, "Right away, sir.")
@@ -4343,6 +4371,19 @@ async def voice_handler(ws: WebSocket):
                                     asyncio.create_task(_execute_lights(embedded_action["target"], voice_state, ws))
                                 elif embedded_action["action"] == "gate":
                                     asyncio.create_task(_execute_gate(voice_state, ws))
+                                elif embedded_action["action"] == "outfit":
+                                    # Change Marion's avatar look live (no reload). The
+                                    # frontend swaps the still + restarts the talking
+                                    # stream; a manual look overrides the weather until
+                                    # "auto". Her spoken reply confirms.
+                                    _look = (embedded_action.get("target") or "").strip().lower()
+                                    _look = {"bikini": "sun", "summer": "sun", "soleil": "sun",
+                                             "pluie": "rain", "umbrella": "rain", "parapluie": "rain",
+                                             "normal": "default", "normale": "default",
+                                             "meteo": "auto", "météo": "auto", "weather": "auto"}.get(_look, _look)
+                                    if _look not in ("sun", "rain", "default", "auto"):
+                                        _look = "auto"
+                                    await ws.send_json({"type": "set_look", "look": _look})
                                 elif embedded_action["action"] == "music":
                                     # Marion's spoken reply confirms; playback runs in background.
                                     asyncio.create_task(_execute_music(embedded_action["target"], voice_state, ws))
