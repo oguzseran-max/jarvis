@@ -533,7 +533,7 @@ function endBoot() {
   // its own voice. The mic starts only when the briefing finishes (onFinished).
   awaitingBriefing = true;
   transition("thinking");
-  setTimeout(() => socket.send({ type: "briefing" }), 600);
+  setTimeout(() => socket.send({ type: "briefing", lang: currentLang }), 600);
   // Safety net for the rare case the briefing produces NO audio at all. Kept
   // well beyond any real briefing length (the briefing can run ~60s) so it never
   // fires mid-briefing and cuts the end off — onFinished is the normal trigger.
@@ -607,7 +607,7 @@ function startBoot() {
   // Prefetch the briefing NOW (during the ~28s boot) so it's ready instantly
   // when the boot ends — no second wait.
   socket.send({ type: "set_lang", lang: currentLang });
-  socket.send({ type: "briefing_prefetch" });
+  socket.send({ type: "briefing_prefetch", lang: currentLang });
   // Pre-connect Marion's live stream during the boot if she's the active
   // persona, so the ~2-3s WebRTC handshake is hidden behind the boot screen
   // and she's already online (warmed up) the instant the boot ends.
