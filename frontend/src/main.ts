@@ -15,8 +15,11 @@ import { createCornerHud } from "./hud";
 import { createSecurityHud } from "./security_hud";
 import { createPerfHud } from "./perf_hud";
 import { createBugfixHud } from "./bugfix_hud";
-import { createFormationHud } from "./formation_hud";
-import { createLearningHud } from "./learning_hud";
+// Auto-évaluation (formation_hud) + Self-Improvements (learning_hud) panels are
+// disabled for now — kept in the tree, just not mounted. Re-add the imports +
+// the create/reveal calls below to bring them back.
+// import { createFormationHud } from "./formation_hud";
+// import { createLearningHud } from "./learning_hud";
 import { createSurveillance } from "./surveillance";
 import { createAudioPlayer } from "./voice";
 import { createAudioCapture } from "./audio_capture";
@@ -87,8 +90,8 @@ const cornerHud = createCornerHud(); // persistent 4-corner monitoring panels
 const securityHud = createSecurityHud(); // mid-left live WatchGuard threat panel
 const perfHud = createPerfHud(); // left-side live voice-loop telemetry (Phase 0)
 const bugfixHud = createBugfixHud(); // bottom-centre review panel for autonomous fixes (Phase 2)
-const formationHud = createFormationHud(); // right-side review panel for learned guidance (Phase 3)
-const learningHud = createLearningHud(); // mid-right live Self-Evolution panel
+// const formationHud = createFormationHud(); // Auto-évaluation panel — disabled
+// const learningHud = createLearningHud();   // Self-Improvements panel — disabled
 const buildHud = createBuildHud(); // middle-right progress panel for background builds
 
 // Live gate camera (DoorBird) — a small panel bottom-left, PLUS a centre-screen
@@ -506,8 +509,6 @@ bootMusic.addEventListener("timeupdate", () => {
   securityHud.reveal();
   perfHud.reveal();
   bugfixHud.reveal();
-  formationHud.reveal();
-  learningHud.reveal();
     bootOverlay.classList.add("done");
     fadeMusicTo(AMBIENT_MUSIC_VOL, 2500);
   }
@@ -525,8 +526,6 @@ function endBoot() {
   securityHud.reveal();
   perfHud.reveal();
   bugfixHud.reveal();
-  formationHud.reveal();
-  learningHud.reveal();
   boot.fadeOut();
   bootOverlay.classList.add("done");
   setTimeout(() => { boot.dispose(); bootOverlay.style.display = "none"; }, 1500);
@@ -758,8 +757,6 @@ if (["rain", "storm", "clear", "clouds"].includes(decodeURIComponent(location.ha
   securityHud.reveal();
   perfHud.reveal();
   bugfixHud.reveal();
-  formationHud.reveal();
-  learningHud.reveal();
   setLanguage("fr");         // show Marion (with her weather accessory)
   // weather.start() (above) reads the hash and stages the effect.
 }
