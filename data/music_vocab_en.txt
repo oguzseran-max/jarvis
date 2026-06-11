@@ -1,0 +1,33 @@
+# Artist / band / song names to prime Whisper (English context).
+# One per line (commas also work). Lines starting with # are ignored.
+# Auto-extended by tools/sync_music_vocab.py from Spotify; keep this seed short.
+# --- household favourites ---
+Dire Straits
+Sultans of Swing
+Phil Collins
+Genesis
+Daft Punk
+# --- classic / rock ---
+The Beatles
+Pink Floyd
+Led Zeppelin
+Queen
+The Rolling Stones
+Fleetwood Mac
+David Bowie
+AC/DC
+Nirvana
+Radiohead
+Red Hot Chili Peppers
+Arctic Monkeys
+# --- pop / soul / hip-hop ---
+Michael Jackson
+Stevie Wonder
+Amy Winehouse
+Adele
+Beyoncé
+The Weeknd
+Dua Lipa
+Billie Eilish
+Kendrick Lamar
+Eminem

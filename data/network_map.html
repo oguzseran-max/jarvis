@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>J.A.R.V.I.S // Network Surveillance</title>
+<style>
+  :root{
+    --bg:#03070d; --panel:rgba(8,20,32,.72); --line:rgba(0,229,192,.18);
+    --teal:#00e5c0; --cyan:#39c6ff; --txt:#bfe9e4; --dim:#5d7e84;
+    --high:#ff3b5c; --med:#ffb020; --watch:#8a7bff; --low:#00e5c0;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:
+      radial-gradient(1200px 700px at 50% -10%, rgba(0,120,120,.10), transparent 60%),
+      repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.18) 2px 3px),
+      linear-gradient(160deg,#03070d,#04101a);
+    color:var(--txt);
+    font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+    overflow-x:hidden;
+  }
+  a{color:var(--cyan)}
+  .hud{max-width:1500px;margin:0 auto;padding:22px 26px 60px}
+  /* header */
+  header{display:flex;align-items:flex-end;justify-content:space-between;
+    border-bottom:1px solid var(--line);padding-bottom:14px;gap:20px;flex-wrap:wrap}
+  h1{margin:0;font-size:22px;letter-spacing:.34em;font-weight:600;
+    color:#eafffb;text-shadow:0 0 18px rgba(0,229,192,.5)}
+  h1 b{color:var(--teal)}
+  .sub{color:var(--dim);font-size:12px;letter-spacing:.18em;margin-top:6px}
+  .chips{display:flex;gap:10px;flex-wrap:wrap}
+  .chip{border:1px solid var(--line);border-radius:3px;padding:7px 12px;
+    background:var(--panel);font-size:11px;letter-spacing:.12em;min-width:78px;text-align:center}
+  .chip .n{display:block;font-size:20px;font-weight:700;letter-spacing:0;margin-top:2px}
+  .chip.t .n{color:var(--low)} .chip.w .n{color:var(--watch)}
+  .chip.h .n{color:var(--high)} .chip.all .n{color:var(--cyan)}
+  /* toolbar */
+  .bar{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0 14px;align-items:center}
+  .f{cursor:pointer;border:1px solid var(--line);background:rgba(0,229,192,.04);
+    color:var(--dim);padding:7px 13px;border-radius:3px;font:inherit;font-size:11px;
+    letter-spacing:.14em;transition:.15s}
+  .f:hover{color:var(--txt);border-color:var(--teal)}
+  .f.on{color:#021014;background:var(--teal);border-color:var(--teal);
+    box-shadow:0 0 16px rgba(0,229,192,.45);font-weight:700}
+  .bar input{margin-left:auto;background:rgba(0,0,0,.4);border:1px solid var(--line);
+    color:var(--txt);padding:8px 12px;border-radius:3px;font:inherit;font-size:12px;min-width:180px}
+  /* layout */
+  .grid{display:grid;grid-template-columns:1fr 360px;gap:22px}
+  @media(max-width:1040px){.grid{grid-template-columns:1fr}}
+  .map{position:relative;background:var(--panel);border:1px solid var(--line);
+    border-radius:6px;min-height:560px;overflow:hidden}
+  svg{width:100%;height:100%;display:block}
+  .ring{fill:none;stroke:rgba(0,229,192,.10)}
+  .spoke{stroke:rgba(0,229,192,.12);stroke-width:1}
+  .node{cursor:pointer;transition:.15s}
+  .node text{font-size:9px;fill:var(--dim);text-anchor:middle;letter-spacing:.05em}
+  .node:hover text,.node.sel text{fill:#eafffb}
+  .node .glow{opacity:.0;transition:.2s}
+  .node:hover .glow,.node.sel .glow{opacity:.55}
+  .ico{font-size:15px;text-anchor:middle;dominant-baseline:central}
+  .sweep{transform-origin:center;animation:spin 7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .dash{stroke-dasharray:3 4;animation:march 14s linear infinite}
+  @keyframes march{to{stroke-dashoffset:-200}}
+  .pulse{animation:pul 1.8s ease-in-out infinite}
+  @keyframes pul{0%,100%{opacity:.25}50%{opacity:.85}}
+  /* detail panel */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    padding:18px;min-height:560px}
+  .panel .empty{color:var(--dim);font-size:12px;letter-spacing:.1em;line-height:1.9;margin-top:8px}
+  .pname{font-size:16px;color:#eafffb;display:flex;align-items:center;gap:10px;margin:0 0 4px}
+  .pip{color:var(--cyan);font-size:13px;letter-spacing:.1em}
+  .badge{display:inline-block;padding:3px 9px;border-radius:3px;font-size:10px;
+    letter-spacing:.12em;margin:8px 8px 0 0;border:1px solid}
+  .b-high{color:var(--high);border-color:var(--high);background:rgba(255,59,92,.08)}
+  .b-med{color:var(--med);border-color:var(--med);background:rgba(255,176,32,.08)}
+  .b-watch{color:var(--watch);border-color:var(--watch);background:rgba(138,123,255,.08)}
+  .b-low{color:var(--low);border-color:var(--low);background:rgba(0,229,192,.08)}
+  .b-trust{color:var(--low);border-color:var(--low)}
+  .b-surv{color:var(--watch);border-color:var(--watch)}
+  .rows{margin-top:16px;border-top:1px solid var(--line);padding-top:12px}
+  .row{display:flex;justify-content:space-between;gap:14px;padding:6px 0;font-size:12px;
+    border-bottom:1px dashed rgba(0,229,192,.08)}
+  .row span:first-child{color:var(--dim);letter-spacing:.1em}
+  .row span:last-child{color:var(--txt);text-align:right;word-break:break-all}
+  .ports{margin-top:6px;display:flex;flex-wrap:wrap;gap:6px}
+  .port{font-size:10px;border:1px solid var(--med);color:var(--med);
+    padding:2px 7px;border-radius:3px;background:rgba(255,176,32,.06)}
+  .port.none{border-color:var(--low);color:var(--low);background:rgba(0,229,192,.06)}
+  .note{margin-top:14px;font-size:12px;line-height:1.7;color:var(--txt);
+    border-left:2px solid var(--teal);padding:4px 0 4px 12px;background:rgba(0,229,192,.04)}
+  /* cards */
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px;margin-top:24px}
+  .card{cursor:pointer;background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    padding:13px;transition:.15s;border-left:3px solid var(--dim)}
+  .card:hover{border-color:var(--teal);transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.4)}
+  .card.r-high{border-left-color:var(--high)} .card.r-med{border-left-color:var(--med)}
+  .card.r-watch{border-left-color:var(--watch)} .card.r-low{border-left-color:var(--low)}
+  .card.hide{display:none}
+  .card h3{margin:0 0 4px;font-size:13px;color:#eafffb;display:flex;gap:8px;align-items:center}
+  .card .ip{color:var(--cyan);font-size:11px;letter-spacing:.08em}
+  .card .meta{color:var(--dim);font-size:10.5px;margin-top:7px;letter-spacing:.05em}
+  .legend{margin-top:26px;display:flex;gap:18px;flex-wrap:wrap;color:var(--dim);
+    font-size:11px;letter-spacing:.1em;border-top:1px solid var(--line);padding-top:14px}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .foot{margin-top:18px;color:var(--dim);font-size:10.5px;letter-spacing:.12em;line-height:1.8}
+</style>
+</head>
+<body>
+<div class="hud">
+  <header>
+    <div>
+      <h1>J<b>.</b>A<b>.</b>R<b>.</b>V<b>.</b>I<b>.</b>S <b>//</b> NETWORK&nbsp;SURVEILLANCE</h1>
+      <div class="sub" id="sub">—</div>
+    </div>
+    <div class="chips" id="chips"></div>
+  </header>
+
+  <div class="bar" id="filters">
+    <button class="f on" data-f="all">TOUS</button>
+    <button class="f" data-f="camera">📷 CAMÉRAS</button>
+    <button class="f" data-f="iot">🏠 IoT</button>
+    <button class="f" data-f="mobile">📱 MOBILES</button>
+    <button class="f" data-f="trusted">✓ CONFIANCE</button>
+    <button class="f" data-f="watch">◎ SURVEILLÉS</button>
+    <button class="f" data-f="risk">⚠ RISQUE</button>
+    <button class="f" id="rescan" title="Relancer un scan réseau">⟳ RESCAN</button>
+    <input id="q" placeholder="rechercher…" autocomplete="off">
+  </div>
+
+  <div class="grid">
+    <div class="map"><svg id="svg" viewBox="0 0 760 620" preserveAspectRatio="xMidYMid meet"></svg></div>
+    <div class="panel" id="panel">
+      <div class="empty">▸ Sélectionne un nœud sur la carte ou une fiche ci-dessous.<br><br>
+        Chaque appareil du réseau interne est représenté autour de la passerelle.
+        Couleur = niveau de risque. Anneau pointillé clignotant = sous surveillance.</div>
+    </div>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="legend">
+    <span><i class="dot" style="background:var(--high)"></i>Risque élevé</span>
+    <span><i class="dot" style="background:var(--med)"></i>Risque moyen</span>
+    <span><i class="dot" style="background:var(--watch)"></i>Sous surveillance / non confirmé</span>
+    <span><i class="dot" style="background:var(--low)"></i>Faible / de confiance</span>
+  </div>
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+let DATA = {"scanned_at": "2026-06-06 00:25:20", "subnet": "192.168.1.0/24", "count": 14, "devices": [{"ip": "192.168.1.1", "mac": "44:d4:54:0d:2a:b0", "vendor": "Sagemcom Broadband SAS", "host": "livebox.home", "label": "Livebox Orange (box / passerelle)", "ports": ["53/DNS", "80/HTTP", "443/HTTPS"], "type": "gateway", "icon": "🌐", "risk": "medium", "note": "Box / passerelle Internet. Admin en HTTP clair — mot de passe fort + pas d'admin distante.", "trusted": true}, {"ip": "192.168.1.10", "mac": "00:1a:22:25:7d:70", "vendor": "eQ-3 Entwicklung GmbH", "host": "eq3-hmip-hap2-7583.home", "label": "Hub Homematic IP (domotique)", "ports": [], "type": "iot", "icon": "🏠", "risk": "low", "note": "Hub domotique Homematic IP. Pas de port exposé.", "trusted": true}, {"ip": "192.168.1.11", "mac": "78:be:81:c5:c0:f3", "vendor": "FN-LINK TECHNOLOGY Ltd.", "host": "device-18.home", "label": "Mobile/tablette (FN-Link) — à confirmer ⚠", "ports": [], "type": "mobile", "icon": "📱", "risk": "watch", "note": "Non confirmé. Profil mobile/tablette (module FN-Link, aucun service). Sous surveillance.", "trusted": false}, {"ip": "192.168.1.12", "mac": "84:46:93:bf:ad:ee", "vendor": "Beijing Xiaomi Mobile Software Co., Ltd", "host": "", "label": "Appareil Xiaomi", "ports": [], "type": "mobile", "icon": "📱", "risk": "medium", "note": "Appareil Xiaomi. Télémétrie vers cloud étranger — idéalement réseau invité.", "trusted": true}, {"ip": "192.168.1.13", "mac": "84:e3:42:ed:98:9b", "vendor": "Tuya Smart Inc.", "host": "wlan0.home", "label": "Prise/ampoule Tuya (domotique)", "ports": [], "type": "iot", "icon": "🏠", "risk": "medium", "note": "IoT Tuya (cloud chinois). Pas de surface locale, mais dépendance/ télémétrie cloud.", "trusted": true}, {"ip": "192.168.1.14", "mac": "f4:14:bf:8b:37:04", "vendor": "LG Innotek", "host": "lgwebostv.home", "label": "TV LG (webOS)", "ports": ["8008/Cast", "8443/HTTPS-alt"], "type": "tv", "icon": "📺", "risk": "medium", "note": "TV LG webOS. Historique de vulnérabilités + micro. Firmware à jour.", "trusted": true}, {"ip": "192.168.1.15", "mac": "50:1e:2d:6d:d8:1f", "vendor": "StreamUnlimited Engineering GmbH", "host": "heddon-501e2d6dd81e.home", "label": "Enceinte HEDDON (Spotify)", "ports": ["80/HTTP", "8008/Cast", "8443/HTTPS-alt"], "type": "audio", "icon": "🔊", "risk": "low", "note": "Enceinte HEDDON (Spotify Connect).", "trusted": true}, {"ip": "192.168.1.18", "mac": "68:4e:05:35:d9:fc", "vendor": "HUNAN FN-LINK TECHNOLOGY LIMITED", "host": "android.home", "label": "Android (téléphone/tablette) — à confirmer ⚠", "ports": [], "type": "mobile", "icon": "📱", "risk": "watch", "note": "Auto-déclaré « android ». Téléphone/tablette probable. Sous surveillance.", "trusted": false}, {"ip": "192.168.1.26", "mac": "1c:ca:e3:7e:68:7c", "vendor": "Bird Home Automation GmbH", "host": "bha-1ccae376dae4.home", "label": "DoorBird (interphone / caméra)", "ports": ["80/HTTP", "443/HTTPS", "554/RTSP"], "type": "camera", "icon": "📷", "risk": "high", "note": "Interphone/caméra DoorBird. RTSP 554 exposé — mot de passe fort, firmware à jour.", "trusted": true}, {"ip": "192.168.1.27", "mac": "a8:3f:a1:76:97:3a", "vendor": "Plejd AB", "host": "gwy01-00256585849.home", "label": "Passerelle Plejd (éclairage)", "ports": [], "type": "iot", "icon": "🏠", "risk": "low", "note": "Passerelle Plejd (éclairage).", "trusted": true}, {"ip": "192.168.1.28", "mac": "1c:ca:e3:7e:a5:b9", "vendor": "Bird Home Automation GmbH", "host": "bha-1ccae3771821.home", "label": "DoorBird #2 (interphone / caméra)", "ports": ["80/HTTP", "443/HTTPS"], "type": "camera", "icon": "📷", "risk": "high", "note": "Seconde caméra/interphone DoorBird.", "trusted": true}, {"ip": "192.168.1.36", "mac": "2a:ab:4d:71:17:9b", "vendor": "", "host": "os77260508.home", "label": "Ce Mac (serveur JARVIS) — LAN", "ports": [], "type": "host", "icon": "💻", "risk": "low", "note": "Ce Mac — serveur JARVIS.", "trusted": true}, {"ip": "192.168.1.40", "mac": "9a:bd:62:38:fb:f0", "vendor": "", "host": "iphone.home", "label": "iPhone d'Oz — LAN", "ports": [], "type": "mobile", "icon": "📱", "risk": "low", "note": "iPhone d'Oz.", "trusted": true}, {"ip": "192.168.1.60", "mac": "70:ee:50:7c:e0:3a", "vendor": "Netatmo", "host": "netatmo-presence-g7ce03a.home", "label": "Caméra Netatmo Presence (extérieur)", "ports": ["80/HTTP"], "type": "camera", "icon": "📷", "risk": "high", "note": "Caméra extérieure Netatmo Presence.", "trusted": true}]};   // embedded by lan_scan.py for the standalone file;
+                               // stays null when served live → fetched from API.
+const RC = {high:"var(--high)",medium:"var(--med)",watch:"var(--watch)",low:"var(--low)"};
+const RLABEL = {high:"RISQUE ÉLEVÉ",medium:"RISQUE MOYEN",watch:"SOUS SURVEILLANCE",low:"FAIBLE"};
+const SVGNS="http://www.w3.org/2000/svg";
+let SEL=null, FILTER="all", Q="";
+
+function el(tag,attrs={},kids=[]){const e=document.createElementNS(SVGNS,tag);
+  for(const k in attrs)e.setAttribute(k,attrs[k]);
+  (Array.isArray(kids)?kids:[kids]).forEach(c=>c&&e.appendChild(c));return e;}
+
+function matches(d){
+  if(Q){const hay=(d.ip+d.mac+d.vendor+d.host+d.label+d.type).toLowerCase();
+    if(!hay.includes(Q))return false;}
+  switch(FILTER){
+    case"all":return true;
+    case"trusted":return d.trusted;
+    case"watch":return !d.trusted||d.risk==="watch";
+    case"risk":return d.risk==="high"||d.risk==="medium";
+    default:return d.type===FILTER;
+  }
+}
+
+function buildHeader(){
+  document.getElementById("sub").textContent =
+    `${DATA.subnet}  ·  ${DATA.count} appareils  ·  scan ${DATA.scanned_at}`;
+  const t=DATA.devices.filter(d=>d.trusted).length;
+  const w=DATA.devices.filter(d=>!d.trusted).length;
+  const h=DATA.devices.filter(d=>d.risk==="high").length;
+  document.getElementById("chips").innerHTML =
+    `<div class="chip all">APPAREILS<span class="n">${DATA.count}</span></div>
+     <div class="chip t">CONFIANCE<span class="n">${t}</span></div>
+     <div class="chip w">SURVEILLÉS<span class="n">${w}</span></div>
+     <div class="chip h">RISQUE ÉLEVÉ<span class="n">${h}</span></div>`;
+  document.getElementById("foot").innerHTML =
+    "▸ Régénérer : <code>./venv/bin/python tools/lan_scan.py --open</code>  ·  "+
+    "Données issues du registre WatchGuard (libellés + liste de confiance). "+
+    "Scan TCP léger — instantané, non exhaustif.";
+}
+
+function drawMap(){
+  const svg=document.getElementById("svg");svg.innerHTML="";
+  const cx=380,cy=310;
+  // background rings + radar sweep
+  [70,140,210,280].forEach(r=>svg.appendChild(el("circle",{class:"ring",cx,cy,r})));
+  svg.appendChild(el("line",{class:"sweep",x1:cx,y1:cy,x2:cx,y2:cy-285,
+    stroke:"rgba(0,229,192,.35)","stroke-width":2}));
+  const gw=DATA.devices.find(d=>d.type==="gateway");
+  const others=DATA.devices.filter(d=>d!==gw);
+  // center = gateway
+  if(gw)svg.appendChild(nodeEl(gw,cx,cy,true));
+  const n=others.length, R=265;
+  others.forEach((d,i)=>{
+    const a=(i/n)*2*Math.PI - Math.PI/2;
+    const x=cx+R*Math.cos(a), y=cy+R*Math.sin(a);
+    svg.appendChild(el("line",{class:d.trusted?"spoke":"spoke dash",
+      x1:cx,y1:cy,x2:x,y2:y}));
+    svg.appendChild(nodeEl(d,x,y,false));
+  });
+}
+
+function nodeEl(d,x,y,center){
+  const col=RC[d.risk]||RC.low, r=center?30:19;
+  const g=el("g",{class:"node"+(SEL===d.ip?" sel":""),
+    transform:`translate(${x},${y})`,style:matches(d)?"":"opacity:.16"});
+  g.appendChild(el("circle",{class:"glow",r:r+12,fill:col}));
+  if(!d.trusted)g.appendChild(el("circle",{class:"dash pulse",r:r+5,fill:"none",
+    stroke:col,"stroke-width":1.5}));
+  g.appendChild(el("circle",{r,fill:"rgba(3,12,18,.92)",stroke:col,"stroke-width":2}));
+  g.appendChild(el("text",{class:"ico",y:1},document.createTextNode(d.icon)));
+  const name=d.label||d.host||d.vendor||d.ip;
+  g.appendChild(el("text",{y:r+13},document.createTextNode(
+    name.length>20?name.slice(0,19)+"…":name)));
+  g.appendChild(el("text",{y:r+24,style:"fill:"+col},
+    document.createTextNode(d.ip.split(".").pop())));
+  g.addEventListener("click",()=>select(d.ip));
+  return g;
+}
+
+function select(ip){
+  SEL=ip; const d=DATA.devices.find(x=>x.ip===ip);
+  drawMap(); drawCards();
+  const ports = d.ports.length
+    ? `<div class="ports">${d.ports.map(p=>`<span class="port">${p}</span>`).join("")}</div>`
+    : `<div class="ports"><span class="port none">aucun port ouvert</span></div>`;
+  document.getElementById("panel").innerHTML = `
+    <div class="pname">${d.icon} ${d.label||d.host||d.vendor||"Appareil"}</div>
+    <div class="pip">${d.ip}</div>
+    <span class="badge b-${d.risk}">${RLABEL[d.risk]}</span>
+    <span class="badge ${d.trusted?"b-trust":"b-surv"}">${d.trusted?"✓ DE CONFIANCE":"◎ SOUS SURVEILLANCE"}</span>
+    <div class="rows">
+      <div class="row"><span>TYPE</span><span>${d.type}</span></div>
+      <div class="row"><span>NOM (DHCP)</span><span>${d.host||"—"}</span></div>
+      <div class="row"><span>CONSTRUCTEUR</span><span>${d.vendor||"—"}</span></div>
+      <div class="row"><span>MAC</span><span>${d.mac||"—"}</span></div>
+      <div class="row"><span>LIBELLÉ</span><span>${d.label||"—"}</span></div>
+    </div>
+    <div style="margin-top:14px;font-size:11px;color:var(--dim);letter-spacing:.1em">PORTS / SERVICES</div>
+    ${ports}
+    <div class="note">${d.note||"—"}</div>`;
+}
+
+function drawCards(){
+  const c=document.getElementById("cards");c.innerHTML="";
+  DATA.devices.forEach(d=>{
+    const card=document.createElement("div");
+    card.className=`card r-${d.risk}${matches(d)?"":" hide"}${SEL===d.ip?" sel":""}`;
+    card.innerHTML=`<h3>${d.icon} ${(d.label||d.host||d.vendor||"?").slice(0,26)}</h3>
+      <div class="ip">${d.ip}  ·  ${d.trusted?"✓":"◎"} ${RLABEL[d.risk]}</div>
+      <div class="meta">${d.vendor||"constructeur ?"}<br>${d.ports.length?d.ports.join("  "):"aucun port ouvert"}</div>`;
+    card.addEventListener("click",()=>select(d.ip));
+    c.appendChild(card);
+  });
+}
+
+function apply(){drawMap();drawCards();}
+document.getElementById("filters").addEventListener("click",e=>{
+  const b=e.target.closest(".f");if(!b)return;
+  document.querySelectorAll(".f").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on");FILTER=b.dataset.f;apply();
+});
+document.getElementById("q").addEventListener("input",e=>{Q=e.target.value.toLowerCase().trim();apply();});
+
+const rescanBtn=document.getElementById("rescan");
+rescanBtn.addEventListener("click",async()=>{
+  rescanBtn.classList.add("on");rescanBtn.textContent="⟳ SCAN…";
+  try{
+    const r=await fetch("/api/network/scan",{method:"POST"});
+    DATA=await r.json();SEL=null;buildHeader();apply();
+  }catch(e){alert("Scan indisponible (backend hors ligne ?) — "+e);}
+  rescanBtn.classList.remove("on");rescanBtn.textContent="⟳ RESCAN";
+});
+
+function render(){buildHeader();apply();}
+async function boot(){
+  if(!DATA){                       // served live: pull the latest inventory
+    try{ DATA=await (await fetch("/api/network/inventory")).json(); }
+    catch(e){ DATA=null; }
+  }
+  if(DATA&&DATA.devices)render();
+  else document.body.innerHTML=
+    "<p style='padding:48px;color:#bfe9e4'>Aucun inventaire. Lance un scan : "+
+    "<code>./venv/bin/python tools/lan_scan.py</code> — ou clique RESCAN si le backend tourne.</p>";
+}
+boot();
+</script>
+</body>
+</html>

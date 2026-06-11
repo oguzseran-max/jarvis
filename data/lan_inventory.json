@@ -1,0 +1,209 @@
+{
+ "scanned_at": "2026-06-06 00:25:20",
+ "subnet": "192.168.1.0/24",
+ "count": 14,
+ "devices": [
+  {
+   "ip": "192.168.1.1",
+   "mac": "44:d4:54:0d:2a:b0",
+   "vendor": "Sagemcom Broadband SAS",
+   "host": "livebox.home",
+   "label": "Livebox Orange (box / passerelle)",
+   "ports": [
+    "53/DNS",
+    "80/HTTP",
+    "443/HTTPS"
+   ],
+   "type": "gateway",
+   "icon": "🌐",
+   "risk": "medium",
+   "note": "Box / passerelle Internet. Admin en HTTP clair — mot de passe fort + pas d'admin distante.",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.10",
+   "mac": "00:1a:22:25:7d:70",
+   "vendor": "eQ-3 Entwicklung GmbH",
+   "host": "eq3-hmip-hap2-7583.home",
+   "label": "Hub Homematic IP (domotique)",
+   "ports": [],
+   "type": "iot",
+   "icon": "🏠",
+   "risk": "low",
+   "note": "Hub domotique Homematic IP. Pas de port exposé.",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.11",
+   "mac": "78:be:81:c5:c0:f3",
+   "vendor": "FN-LINK TECHNOLOGY Ltd.",
+   "host": "device-18.home",
+   "label": "Mobile/tablette (FN-Link) — à confirmer ⚠",
+   "ports": [],
+   "type": "mobile",
+   "icon": "📱",
+   "risk": "watch",
+   "note": "Non confirmé. Profil mobile/tablette (module FN-Link, aucun service). Sous surveillance.",
+   "trusted": false
+  },
+  {
+   "ip": "192.168.1.12",
+   "mac": "84:46:93:bf:ad:ee",
+   "vendor": "Beijing Xiaomi Mobile Software Co., Ltd",
+   "host": "",
+   "label": "Appareil Xiaomi",
+   "ports": [],
+   "type": "mobile",
+   "icon": "📱",
+   "risk": "medium",
+   "note": "Appareil Xiaomi. Télémétrie vers cloud étranger — idéalement réseau invité.",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.13",
+   "mac": "84:e3:42:ed:98:9b",
+   "vendor": "Tuya Smart Inc.",
+   "host": "wlan0.home",
+   "label": "Prise/ampoule Tuya (domotique)",
+   "ports": [],
+   "type": "iot",
+   "icon": "🏠",
+   "risk": "medium",
+   "note": "IoT Tuya (cloud chinois). Pas de surface locale, mais dépendance/ télémétrie cloud.",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.14",
+   "mac": "f4:14:bf:8b:37:04",
+   "vendor": "LG Innotek",
+   "host": "lgwebostv.home",
+   "label": "TV LG (webOS)",
+   "ports": [
+    "8008/Cast",
+    "8443/HTTPS-alt"
+   ],
+   "type": "tv",
+   "icon": "📺",
+   "risk": "medium",
+   "note": "TV LG webOS. Historique de vulnérabilités + micro. Firmware à jour.",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.15",
+   "mac": "50:1e:2d:6d:d8:1f",
+   "vendor": "StreamUnlimited Engineering GmbH",
+   "host": "heddon-501e2d6dd81e.home",
+   "label": "Enceinte HEDDON (Spotify)",
+   "ports": [
+    "80/HTTP",
+    "8008/Cast",
+    "8443/HTTPS-alt"
+   ],
+   "type": "audio",
+   "icon": "🔊",
+   "risk": "low",
+   "note": "Enceinte HEDDON (Spotify Connect).",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.18",
+   "mac": "68:4e:05:35:d9:fc",
+   "vendor": "HUNAN FN-LINK TECHNOLOGY LIMITED",
+   "host": "android.home",
+   "label": "Android (téléphone/tablette) — à confirmer ⚠",
+   "ports": [],
+   "type": "mobile",
+   "icon": "📱",
+   "risk": "watch",
+   "note": "Auto-déclaré « android ». Téléphone/tablette probable. Sous surveillance.",
+   "trusted": false
+  },
+  {
+   "ip": "192.168.1.26",
+   "mac": "1c:ca:e3:7e:68:7c",
+   "vendor": "Bird Home Automation GmbH",
+   "host": "bha-1ccae376dae4.home",
+   "label": "DoorBird (interphone / caméra)",
+   "ports": [
+    "80/HTTP",
+    "443/HTTPS",
+    "554/RTSP"
+   ],
+   "type": "camera",
+   "icon": "📷",
+   "risk": "high",
+   "note": "Interphone/caméra DoorBird. RTSP 554 exposé — mot de passe fort, firmware à jour.",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.27",
+   "mac": "a8:3f:a1:76:97:3a",
+   "vendor": "Plejd AB",
+   "host": "gwy01-00256585849.home",
+   "label": "Passerelle Plejd (éclairage)",
+   "ports": [],
+   "type": "iot",
+   "icon": "🏠",
+   "risk": "low",
+   "note": "Passerelle Plejd (éclairage).",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.28",
+   "mac": "1c:ca:e3:7e:a5:b9",
+   "vendor": "Bird Home Automation GmbH",
+   "host": "bha-1ccae3771821.home",
+   "label": "DoorBird #2 (interphone / caméra)",
+   "ports": [
+    "80/HTTP",
+    "443/HTTPS"
+   ],
+   "type": "camera",
+   "icon": "📷",
+   "risk": "high",
+   "note": "Seconde caméra/interphone DoorBird.",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.36",
+   "mac": "2a:ab:4d:71:17:9b",
+   "vendor": "",
+   "host": "os77260508.home",
+   "label": "Ce Mac (serveur JARVIS) — LAN",
+   "ports": [],
+   "type": "host",
+   "icon": "💻",
+   "risk": "low",
+   "note": "Ce Mac — serveur JARVIS.",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.40",
+   "mac": "9a:bd:62:38:fb:f0",
+   "vendor": "",
+   "host": "iphone.home",
+   "label": "iPhone d'Oz — LAN",
+   "ports": [],
+   "type": "mobile",
+   "icon": "📱",
+   "risk": "low",
+   "note": "iPhone d'Oz.",
+   "trusted": true
+  },
+  {
+   "ip": "192.168.1.60",
+   "mac": "70:ee:50:7c:e0:3a",
+   "vendor": "Netatmo",
+   "host": "netatmo-presence-g7ce03a.home",
+   "label": "Caméra Netatmo Presence (extérieur)",
+   "ports": [
+    "80/HTTP"
+   ],
+   "type": "camera",
+   "icon": "📷",
+   "risk": "high",
+   "note": "Caméra extérieure Netatmo Presence.",
+   "trusted": true
+  }
+ ]
+}

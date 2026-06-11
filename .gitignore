@@ -1,11 +1,16 @@
 # Environment
 .env
 .env.local
+.env.save
+
+# Runtime logs / pids (start_jarvis.sh)
+.run/
 
 # Dependencies
 node_modules/
 .venv/
 venv/
+whisper-venv/
 
 # Python
 __pycache__/
@@ -18,9 +23,16 @@ __pycache__/
 data/*.jsonl
 data/active_session.json
 data/.jarvis_output.txt
+# D-ID source-image URL caches — D-ID image URLs expire, so these are
+# regenerated at runtime; versioning a stale URL re-breaks Marion's lip-sync.
+data/did_source_*.txt
 
 # Certificates
 *.pem
+# Backup copies of certs/keys (the *.pem rule misses the .bak suffix — and these
+# can hold a PRIVATE KEY, so never commit them).
+*.pem.*.bak
+*.bak
 
 # Build
 dist/
@@ -39,3 +51,32 @@ desktop-overlay/node_modules/
 context/
 *.db-shm
 *.db-wal
+
+# Gmail OAuth secrets
+gmail_credentials.json
+gmail_token.json
+
+# boot audio build tooling
+.audio-venv/
+tools/boot_build/sep/
+tools/boot_build/voice/
+tools/boot_build/shot_*.png
+
+# Family face-enrollment reference photos — NEVER commit (children's photos)
+faces/
+data/faces/
+
+# Face recognition (heavy venv + face embeddings — keep out of git)
+face-venv/
+data/face_db.npz
+
+# Personal reference media (car photo etc.)
+references/
+
+# Personal voice samples & cloning references (voice biometrics of real people —
+# same policy as faces/: NEVER commit). assets/ is a local boot-build input dir
+# holding these source recordings; the produced boot audio (frontend/public/
+# boot_voice_*) is what the app actually ships.
+voice_samples/
+assets/
+tools/boot_build/*_ref.mp3

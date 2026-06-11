@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Idempotently start the JARVIS backend + frontend and open Chrome.
+# Safe to run repeatedly: it only starts what isn't already listening.
+set -u
+
+JARVIS_DIR="/Users/oguz/jarvis"
+BACKEND_PORT=8340
+FRONTEND_PORT=5173
+# Open the STABLE production URL (backend-served build, trusted cert, no vite HMR
+# → no mid-build page reloads). The :5173 dev server still starts for development.
+URL="https://localhost:${BACKEND_PORT}/"
+LOG_DIR="${JARVIS_DIR}/.run"
+mkdir -p "$LOG_DIR"
+
+WHISPER_PORT=8765
+
+port_up() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
+# Whisper STT service (separate Python 3.12 venv — faster-whisper has no 3.14 wheels)
+if port_up "$WHISPER_PORT"; then
+  echo "[jarvis] whisper already running on :$WHISPER_PORT"
+elif [ -x "$JARVIS_DIR/whisper-venv/bin/python" ]; then
+  echo "[jarvis] starting whisper on :$WHISPER_PORT"
+  ( cd "$JARVIS_DIR" && nohup ./whisper-venv/bin/python whisper_service.py \
+      >"$LOG_DIR/whisper.log" 2>&1 & )
+else
+  echo "[jarvis] whisper-venv missing; STT auto-detect disabled" >&2
+fi
+
+# Face-recognition service (separate Python 3.12 venv — insightface). Powers the
+# surveillance mode that greets Leyla / Aylin by name.
+if pgrep -f "face_service.py" >/dev/null 2>&1; then
+  echo "[jarvis] face service already running"
+elif [ -x "$JARVIS_DIR/face-venv/bin/python" ]; then
+  echo "[jarvis] starting face service on :8770"
+  ( cd "$JARVIS_DIR" && nohup ./face-venv/bin/python face_service.py \
+      >"$LOG_DIR/face.log" 2>&1 & )
+else
+  echo "[jarvis] face-venv missing; surveillance face-recognition disabled" >&2
+fi
+
+# Backend
+if port_up "$BACKEND_PORT"; then
+  echo "[jarvis] backend already running on :$BACKEND_PORT"
+else
+  echo "[jarvis] starting backend on :$BACKEND_PORT"
+  ( cd "$JARVIS_DIR" && nohup ./venv/bin/python server.py \
+      >"$LOG_DIR/backend.log" 2>&1 & )
+fi
+
+# WatchGuard — real-time intrusion watch (Phase 1: observe + alert, never blocks)
+if pgrep -f "watchguard.py" >/dev/null 2>&1; then
+  echo "[jarvis] watchguard already running"
+else
+  echo "[jarvis] starting watchguard"
+  ( cd "$JARVIS_DIR" && nohup ./venv/bin/python watchguard.py \
+      >"$LOG_DIR/watchguard.log" 2>&1 & )
+fi
+
+# Frontend
+if port_up "$FRONTEND_PORT"; then
+  echo "[jarvis] frontend already running on :$FRONTEND_PORT"
+else
+  echo "[jarvis] starting frontend on :$FRONTEND_PORT"
+  ( cd "$JARVIS_DIR/frontend" && nohup npm run dev \
+      >"$LOG_DIR/frontend.log" 2>&1 & )
+fi
+
+# Wait (bounded) for the backend (which serves the app on :8340) to accept
+# connections, then open Chrome once.
+for _ in $(seq 1 30); do
+  port_up "$BACKEND_PORT" && break
+  sleep 0.5
+done
+
+if port_up "$BACKEND_PORT"; then
+  # Don't pile up tabs: this script runs on every Claude session start, so only
+  # open Chrome if no JARVIS tab is already there. If one exists, just focus it.
+  already=$(osascript -e 'tell application "Google Chrome"
+    set found to false
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (URL of t) contains "localhost:8340" then set found to true
+      end repeat
+    end repeat
+    return found
+  end tell' 2>/dev/null)
+  if [ "$already" = "true" ]; then
+    echo "[jarvis] JARVIS tab already open — not opening another"
+  else
+    open -a "Google Chrome" "$URL"
+    echo "[jarvis] opened $URL in Chrome"
+  fi
+else
+  echo "[jarvis] backend did not come up in time; not opening browser" >&2
+fi

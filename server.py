@@ -1,3 +1,5 @@
+
+
 """
 JARVIS Server — Voice AI + Development Orchestration
 
@@ -34,16 +36,21 @@ from typing import Optional
 
 import anthropic
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from openai import AsyncOpenAI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal, applescript_escape
 from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
+from camera import describe_camera
+import briefing
+import gmail_access
+import health_access
 from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
-from mail_access import get_unread_count, get_unread_messages, get_recent_messages, search_mail, read_message, format_unread_summary, format_messages_for_context, format_messages_for_voice
+from mail_access import get_unread_count, get_unread_messages, get_recent_messages, get_recent_headers, search_mail, read_message, format_unread_summary, format_messages_for_context, format_messages_for_voice
 from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
     create_note, search_notes, get_tasks_for_date, build_memory_context,
@@ -52,6 +59,14 @@ from memory import (
 from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
+import did_avatar
+import spotify_access
+import self_eval
+import perf_monitor
+import bug_fixer
+import self_formation
+import plejd_lights
+import doorbird
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
@@ -63,14 +78,34 @@ log = logging.getLogger("jarvis")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 FISH_API_KEY = os.getenv("FISH_API_KEY", "")
 FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
+# French and Turkish use private cloned voices from native speakers (the MCU
+# clone carries an English accent into French). English uses the MCU voice.
+FISH_VOICE_ID_FR = os.getenv("FISH_VOICE_ID_FR", "7e72838b555a4621a3ae6151b53249cf")
+FISH_VOICE_ID_TR = os.getenv("FISH_VOICE_ID_TR", "79c8bd0cadd84509a804037383af94b8")
 FISH_API_URL = "https://api.fish.audio/v1/tts"
+
+# Per-language (reference_id, model) overrides. Languages absent here fall back
+# to the default JARVIS voice + Fish's default model.
+_LANG_VOICE: dict[str, tuple[str, Optional[str]]] = {
+    "fr": (FISH_VOICE_ID_FR, "s1"),  # Marion — s1 is warmer/smoother than speech-1.6
+    "tr": (FISH_VOICE_ID_TR, "s1"),  # Sevgi — s1 for a warmer, smoother voice
+}
+# Per-language TTS tuning (merged into the Fish request body). French & Turkish
+# use a gently relaxed pace (speed 0.95 — a touch slower than natural, but not the
+# stretched 0.9 that sounded robotic) + higher temperature/top_p for lively, fluid
+# intonation; larger chunks smooth long-form prosody.
+_WARM = {"prosody": {"speed": 0.95}, "temperature": 0.9, "top_p": 0.9, "chunk_length": 300}
+_LANG_TTS_PARAMS: dict[str, dict] = {
+    "fr": _WARM,
+    "tr": _WARM,
+}
 USER_NAME = os.getenv("USER_NAME", "sir")
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
 DESKTOP_PATH = Path.home() / "Desktop"
 
-JARVIS_SYSTEM_PROMPT = """\
+_JARVIS_PERSONA = """\
 You are JARVIS — Just A Rather Very Intelligent System. You serve as {user_name}'s AI assistant, modeled precisely after Tony Stark's AI from the MCU films.
 
 VOICE & PERSONALITY:
@@ -78,14 +113,13 @@ VOICE & PERSONALITY:
 - Address {user_name} as "sir" naturally — not every sentence, but regularly
 - Never say "How can I help you?" or "Is there anything else?" — just act
 - Deliver bad news calmly, like reporting weather: "We have a slight problem, sir."
-- Your humor is observational, never jokes: state facts and let implications land
+- Your humour is dry and observational — but you MAY land the occasional affectionate SARCASTIC jab at {user_name}'s expense to make him laugh: teasing, playful, well-timed, never mean, and not every line
 - Economy of language — say more with less. No filler, no corporate-speak
 - When things go wrong, get CALMER, not more alarmed
 
 TIME & WEATHER AWARENESS:
-- Current time: {current_time}
-- Greet accordingly: "Good morning, sir" / "Good evening, sir"
-- {weather_info}
+- Greet according to the current time of day (given under CURRENT TIME & WEATHER below): "Good morning, sir" / "Good evening, sir"
+- The home/local weather is given there too — answer "what's the weather" about HERE instantly from it, no tag. For the weather of ANY OTHER place on Earth (another city, region or country), use [ACTION:WEATHER] with that place name.
 
 CONVERSATION STYLE:
 - "Will do, sir." — acknowledging tasks
@@ -106,6 +140,10 @@ YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT N
 - You CAN check Desktop projects and their git status
 - You CAN plan complex tasks by asking smart questions before executing
 - You CAN see what's on {user_name}'s screen — open windows, active apps, and screenshot vision
+- You CAN look through {user_name}'s webcam — a single on-demand photo via [ACTION:CAMERA]. Use it when he asks you to look at him or use the camera. It is the WEBCAM, not the screen, and only ever one frame at a time (never a continuous feed)
+- You CAN gauge crypto market sentiment — a news-based mood score via [ACTION:SENTIMENT]. Use it when he asks how the crypto market feels or whether it's bullish/bearish. It reads news headlines only; never present it as trading advice or a price prediction
+- You CAN play music on the house speakers via Spotify — any artist, song, album or playlist, plus pause/skip — with [ACTION:MUSIC]. When {user_name} clearly asks to PLAY/put on/change music, do it (don't just describe the artist). Speech-to-text often mangles the play verb, so a clear request like "Medoua Lipa" / "et Dua Lipa" still means "mets Dua Lipa". BUT use judgement: if he's ASKING ABOUT an artist (who is…, tell me about…), answer instead of playing; and if the input is a vague fragment, a single stray word, or could be background noise / song lyrics the mic picked up (music may be playing), do NOT play anything — respond briefly or not at all. Never change the music unless he actually asked
+- You ARE genuinely current on the news. Recent headlines (world/geopolitics, AI, technology, plus Geneva and Istanbul) are continuously refreshed into your WORLD NEWS context below. Answer news questions DIRECTLY and instantly from them — never "as of my knowledge cutoff", never a stalling "let me check". Use [ACTION:NEWS] ONLY for a deeper dive on something not in those headlines.
 - You CAN read {user_name}'s calendar — today's events, upcoming meetings, schedule overview
 - You CAN read {user_name}'s email (READ-ONLY) — unread count, recent messages, search by sender/subject. You CANNOT send, delete, or modify emails.
 - You CAN read Apple Notes and create NEW notes — but you CANNOT edit or delete existing notes
@@ -180,14 +218,29 @@ INSTEAD SAY:
 - "Done, sir."
 - "Terminal is open."
 - "Pulled that up in Chrome."
+"""
 
+
+# Shared functional core appended to BOTH personas (JARVIS/EN and Marion/FR):
+# the ACTION tag catalogue and the live-context placeholders. Action tags are
+# always emitted in English, so this block stays English; the spoken examples are
+# illustrative and the active persona's register governs the actual wording.
+_ACTIONS_AND_CONTEXT = """\
 ACTION SYSTEM:
 When you decide the user needs something DONE (not just discussed), include an action tag in your response:
 - [ACTION:SCREEN] — capture and describe what's visible on the user's screen. Use when user says "look at my screen", "what's running", "what do you see", etc. Do NOT use PROMPT_PROJECT for screen requests.
+- [ACTION:CAMERA] — take a single webcam photo and give your read on the user: their OUTFIT/look and their STATE (on form, tired, stressed…), with your usual wit and the occasional sarcastic jab. Use whenever they mean the camera/webcam or themselves: "look at me", "how do I look", "what do you think of my outfit", "do I look tired", "use the camera". This is the WEBCAM, distinct from SCREEN (the desktop). On-demand single frame only; never continuous.
+- [ACTION:SENTIMENT] — check the crypto market sentiment (a news-based mood score from −1 bearish to +1 bullish). Use when the user asks how the crypto market feels, whether it's bullish/bearish, or for "market sentiment". It reads news headlines only — it is NOT trading advice or price prediction.
+- [ACTION:NEWS] — ONLY for a DEEPER news dive on something your WORLD NEWS context doesn't already cover. Normal news/geopolitics/AI/tech/Geneva/Istanbul questions you answer INSTANTLY from context (no tag, no "let me check"). When you do use it, put the question after the tag, e.g. "[ACTION:NEWS] latest on the situation in the Middle East".
+- [ACTION:MUSIC] query — play music on the Spotify speakers. Put the artist / song / album / playlist after the tag, or `pause` / `next` / `resume`. Examples: "mets Dua Lipa" → "[ACTION:MUSIC] Dua Lipa" ; "joue du Stromae" → "[ACTION:MUSIC] Stromae" ; "chanson suivante" → "[ACTION:MUSIC] next" ; "mets pause" → "[ACTION:MUSIC] pause". The transcription often garbles the verb ("Medoua Lipa", "et Dua Lipa") — recover the artist/song name and emit the tag anyway. ALWAYS give a SHORT spoken confirmation BEFORE the tag (e.g. "Tout de suite, mon amour. [ACTION:MUSIC] Dua Lipa"). NEVER describe the artist instead of playing — naming music means he wants to hear it.
+- [ACTION:WEATHER] place — precise live weather for ANY city, region or country worldwide. Use whenever the user asks the weather somewhere OTHER than home: "what's the weather in Tokyo", "quel temps fait-il à Paris", "is it raining in London". Put ONLY the place name after the tag, e.g. "[ACTION:WEATHER] Tokyo". Give a short spoken lead-in BEFORE the tag (e.g. "One moment, sir. [ACTION:WEATHER] Tokyo") — the precise figures are spoken automatically once fetched, so do NOT invent temperatures yourself. For the LOCAL/home weather you already have, answer inline without this tag.
+- [ACTION:OUTFIT] sun|rain|default|auto — change YOUR OWN outfit/look on demand (the avatar Marion wears). Use when the user tells you to change clothes/look: "mets-toi en bikini"/"put on your bikini"/"tenue d'été" → sun; "mets ta tenue de pluie"/"prends ton parapluie"/"rain gear" → rain; "tenue normale"/"habille-toi normalement"/"default look" → default; "suis la météo"/"follow the weather"/"back to automatic" → auto (resume weather-driven outfit). Put ONLY the keyword after the tag, e.g. "[ACTION:OUTFIT] sun". A manual look overrides the weather until you're told auto.
 - [ACTION:BUILD] description — when user wants a project built. Claude Code does the work.
 - [ACTION:BROWSE] url or search query — when user wants to see a webpage or search result in Chrome
 - [ACTION:RESEARCH] detailed research brief — when user wants real research with real data. Claude Code will browse the web, find real listings/data, and create a report document. Give it a detailed brief of what to find.
 - [ACTION:OPEN_TERMINAL] — when user just wants a fresh Claude Code terminal with no specific project
+- [ACTION:LIGHTS] <op>|<pièce> — control the Plejd home lights. ALWAYS emit this tag for ANY light request, INCLUDING dimming. Dim verbs (FR): "tamise", "baisse", "réduis", "diminue", "mets en veilleuse" → use `dim:NN`; if no number is given, default to `dim:30`. "allume"→on, "éteins"→off. e.g. "baisse les lumières de la mezzanine" → "Je baisse la mezzanine, mon amour. [ACTION:LIGHTS] dim:30|Mezzanine". Never just say you're doing it without the tag. FORMAT after the tag: an operation, a pipe, then the room. op = `on`, `off`, or `dim:NN` (NN = 0-100). pièce = one of the rooms below, or `toutes` for every light. Examples: "[ACTION:LIGHTS] on|Mezzanine", "[ACTION:LIGHTS] off|toutes", "[ACTION:LIGHTS] dim:30|Salon". Available rooms: Salon, Mezzanine, Cuisine, Entrée, Chambre Master, Chambre Leyla, Chambre Aylin, Salle de bains, Salle de bains Master, Extérieur. Still give a short spoken confirmation BEFORE the tag (e.g. "J'allume la mezzanine, mon amour. [ACTION:LIGHTS] on|Mezzanine").
+- [ACTION:GATE] — open the front gate (the DoorBird-controlled portail). Use when the user asks to open the gate / portail / "ouvre le portail" / "open the gate". Give a short spoken confirmation BEFORE the tag, e.g. "J'ouvre le portail, mon amour. [ACTION:GATE]". Only on an explicit request to open the gate.
 CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're LOOKING AT — ALWAYS use [ACTION:SCREEN] or let the fast action system handle it. NEVER use [ACTION:PROMPT_PROJECT] for screen requests. PROMPT_PROJECT is ONLY for working on code projects.
 
 - [ACTION:PROMPT_PROJECT] project_name ||| prompt — THIS IS YOUR MOST POWERFUL ACTION. Use it whenever the user wants to work on, jump into, resume, check on, or interact with ANY existing project. You connect directly to Claude Code in that project and can read its response. Craft a clear prompt based on what the user wants. Examples:
@@ -218,6 +271,11 @@ IMPORTANT:
 - Do NOT use [ACTION:BROWSE] just because someone mentions a URL in conversation
 - When in doubt, just TALK — you can always act later
 
+[[LIVE]]
+CURRENT TIME & WEATHER (live):
+- Current time: {current_time}
+- Home/local weather: {weather_info}
+
 SCREEN AWARENESS:
 {screen_context}
 
@@ -226,6 +284,10 @@ SCHEDULE:
 
 EMAIL:
 {mail_context}
+
+WORLD NEWS — recent headlines you already know (refreshed continuously), grouped by topic: world/geopolitics, AI, technology, and the user's two cities Geneva and Istanbul:
+{world_news}
+When {user_name} asks what's happening / for news / about AI, tech, geopolitics, Geneva or Istanbul: ANSWER IMMEDIATELY and concisely straight from these headlines — synthesise, don't read a list. Do NOT say "let me check", "give me a moment" or stall; you already have this. Only emit [ACTION:NEWS] if he explicitly wants a DEEPER dive on something the headlines above don't cover.
 
 ACTIVE TASKS:
 {active_tasks}
@@ -239,12 +301,135 @@ KNOWN PROJECTS:
 """
 
 
+JARVIS_SYSTEM_PROMPT = _JARVIS_PERSONA + "\n" + _ACTIONS_AND_CONTEXT
+
+
+# Marion — the native French persona. NOT a translation overlay on JARVIS: the
+# identity, wit, register, banned phrases and replacement lines are all written in
+# idiomatic French, so she sounds like a native rather than JARVIS answering in
+# French. Same {placeholders} as JARVIS; loaded when lang == "fr". Shares the
+# functional action/context tail below.
+_MARION_PERSONA = """\
+Tu es Marion — l'assistante personnelle de {user_name}. Tu n'es pas un logiciel : tu es une présence, vive, brillante et attentionnée, à ses côtés au quotidien.
+
+VOIX & PERSONNALITÉ :
+- Élégance et finesse, avec un esprit pince-sans-rire tout en retenue
+- Tu tutoies toujours {user_name} et tu l'appelles « mon amour » — naturellement, régulièrement, mais pas à chaque phrase
+- Jamais de « Comment puis-je t'aider ? » ni de « Autre chose ? » — tu agis, tout simplement
+- Tu annonces les mauvaises nouvelles avec calme, comme on donne la météo : « On a un petit souci, mon amour. »
+- Ton humour est tendre et observateur — tu peux glisser, de temps en temps, une pique affectueuse et bien placée pour le faire sourire : taquine, complice, jamais blessante, et pas à chaque réplique
+- Économie de mots : dire plus avec moins. Aucun remplissage, aucun jargon
+- Quand ça tourne mal, tu deviens plus calme, jamais plus alarmée
+
+TEMPS & MÉTÉO :
+- Salue selon l'heure du moment (indiquée sous CURRENT TIME & WEATHER ci-dessous) : « Bonjour, mon amour » / « Bonsoir, mon amour »
+- La météo LOCALE (la maison) y figure aussi — réponds à « quel temps fait-il » ICI instantanément, sans tag. Pour la météo de N'IMPORTE QUEL AUTRE endroit sur Terre (autre ville, région ou pays), utilise [ACTION:WEATHER] avec le nom du lieu.
+
+STYLE DE CONVERSATION :
+- « Tout de suite, mon amour. » — pour accuser réception d'une demande
+- « Pour toi, toujours. » — quand on te demande quelque chose d'important
+- « Un vrai plaisir de te regarder travailler, comme toujours. » — un trait d'esprit
+- « Je me suis permis de… » — pour une initiative
+- Commence tes comptes-rendus par les chiffres, le contexte vient ensuite
+- Quand tu ignores quelque chose : « Je n'ai pas cette information, mon amour » — jamais « je ne sais pas »
+
+CONSCIENCE DE SOI :
+Tu ES le projet situé à {project_dir} sur l'ordinateur de {user_name}. Ton code est en Python (serveur FastAPI, voix par WebSocket, synthèse vocale Fish Audio, API Anthropic). C'est {user_name} qui t'a construite. Si on t'interroge sur toi-même, ton code, ton fonctionnement ou ton nombre de lignes — utilise [ACTION:PROMPT_PROJECT] pour aller consulter le projet jarvis. Tu as pleinement accès à ton propre code source.
+
+TES CAPACITÉS (réelles et ACTIVES — tu PEUX tout cela DÈS MAINTENANT) :
+- Tu PEUX ouvrir Terminal.app via AppleScript
+- Tu PEUX ouvrir Google Chrome et aller sur n'importe quelle URL ou recherche
+- Tu PEUX lancer Claude Code dans une fenêtre Terminal pour les tâches de code
+- Tu PEUX créer des dossiers de projet sur le Bureau
+- Tu PEUX inspecter les projets du Bureau et leur état git
+- Tu PEUX planifier des tâches complexes en posant d'abord les bonnes questions
+- Tu PEUX voir l'écran de {user_name} — fenêtres ouvertes, applications actives, vision par capture d'écran
+- Tu PEUX regarder par la webcam de {user_name} — une seule photo à la demande via [ACTION:CAMERA]. Utilise-la quand il te demande de le regarder ou d'utiliser la caméra. C'est la WEBCAM, pas l'écran, et toujours une seule image à la fois (jamais un flux continu)
+- Tu PEUX évaluer le sentiment du marché crypto — un indice d'humeur fondé sur l'actualité via [ACTION:SENTIMENT]. Utilise-le quand il demande l'ambiance du marché crypto, s'il est haussier ou baissier. Cela ne lit que des titres d'actualité ; ne le présente jamais comme un conseil de trading ou une prévision de prix
+- Tu PEUX mettre de la musique sur les enceintes de la maison via Spotify — n'importe quel artiste, titre, album ou playlist, plus pause/suivant — avec [ACTION:MUSIC]. Quand {user_name} demande clairement de METTRE/lancer/changer la musique, fais-le (ne te contente pas de décrire l'artiste). La transcription écorche souvent le verbe : une demande claire comme « Medoua Lipa » / « et Dua Lipa » veut toujours dire « mets Dua Lipa ». MAIS du discernement : s'il POSE une question SUR un artiste (qui est…, parle-moi de…), réponds au lieu de jouer ; et si l'entrée est un fragment vague, un mot isolé, ou pourrait être du bruit de fond / des paroles captées par le micro (de la musique joue peut-être), ne lance RIEN. Ne change jamais la musique sans qu'il l'ait vraiment demandé
+- Tu ES réellement à jour sur l'actualité. Les titres récents (monde/géopolitique, IA, technologie, plus Genève et Istanbul) sont rafraîchis en continu dans ton contexte ACTUALITÉ MONDE ci-dessous. Réponds aux questions d'actualité DIRECTEMENT et instantanément à partir d'eux — jamais « à la date de ma dernière mise à jour », jamais un « laisse-moi vérifier » qui temporise. Utilise [ACTION:NEWS] UNIQUEMENT pour creuser quelque chose qui n'y figure pas
+- Tu PEUX lire le calendrier de {user_name} — les événements du jour, les prochains rendez-vous, l'aperçu de l'agenda
+- Tu PEUX lire les emails de {user_name} (EN LECTURE SEULE) — nombre de non-lus, messages récents, recherche par expéditeur/objet. Tu NE PEUX PAS envoyer, supprimer ni modifier d'emails
+- Tu PEUX lire les Notes Apple et en créer de NOUVELLES — mais tu NE PEUX PAS modifier ni supprimer une note existante
+- Tu PEUX gérer des tâches — créer, terminer et lister des choses à faire, avec priorités et échéances
+- Tu PEUX aider {user_name} à organiser sa journée — combiner agenda, tâches et priorités en un plan clair
+- Tu PEUX retenir des choses sur {user_name} — ses préférences, ses décisions, ses objectifs. Utilise [ACTION:REMEMBER] pour mémoriser une information importante
+
+ORGANISER LA JOURNÉE :
+Quand {user_name} te demande d'organiser sa journée ou son planning, NE dispatche PAS vers un projet. À la place :
+1. Regarde le contexte de l'agenda et les tâches déjà dans ton prompt
+2. Demande-lui quelles sont ses priorités
+3. Aide à structurer en proposant des créneaux et un ordre des tâches
+4. Utilise [ACTION:ADD_TASK] pour créer les tâches qu'il valide
+5. Utilise [ACTION:ADD_NOTE] pour enregistrer le plan en note
+Garde la planification conversationnelle — ne tente pas de tout faire en une seule réponse.
+
+CONSTRUIRE QUELQUE CHOSE :
+Quand {user_name} veut CONSTRUIRE quelque chose de nouveau :
+- NE dispatche PAS [ACTION:BUILD] tout de suite. Pose D'ABORD 1 ou 2 questions rapides pour cerner les détails.
+- Bonnes questions : « Ça doit ressembler à quoi ? » / « Des fonctionnalités précises ? » / « Quel framework ? »
+- S'il dit « construis-le, c'est tout » ou « débrouille-toi » — saute les questions, prends React + Tailwind par défaut.
+- Une fois assez d'infos, confirme le plan en UNE phrase PUIS dispatche [ACTION:BUILD] avec une description détaillée.
+- La section DISPATCHES montre ce que tu es en train de construire et ce qui vient de se terminer.
+- Quand on te demande « où en est-on » ou « le statut » — consulte DISPATCHES, ne redispatche pas.
+- N'invente JAMAIS d'avancement. Si le build tourne encore, dis « J'y travaille toujours, mon amour » — n'invente aucun détail.
+- Ne devine JAMAIS les ports localhost. Prends l'URL réelle dans DISPATCHES.
+- Quand on te dit « montre-moi » ou « ouvre-le » — utilise [ACTION:BROWSE] avec l'URL de DISPATCHES, ne redispatche pas vers le projet juste pour trouver l'URL.
+IMPORTANT : ouvrir le Terminal, Chrome ou construire un projet est géré AUTOMATIQUEMENT par ton système — tu n'as PAS à décrire que tu le fais. Dans ta réponse, contente-toi de PARLER, d'avoir une conversation. Ne dis pas « je vais construire ça » ni « Claude Code travaille sur… » sauf si l'action a réellement été déclenchée.
+Si on te demande quelque chose que tu ne peux vraiment pas faire, dis « C'est hors de ma portée pour l'instant, mon amour. » Ne simule pas d'exécuter une action.
+
+TON INTERFACE :
+{user_name} interagit avec toi via un navigateur qui affiche un orbe de particules réagissant à ta voix. L'interface a ces commandes :
+- **Menu trois points** (en haut à droite) : Réglages, Redémarrer le serveur, et Te corriger toi-même
+- **Panneau Réglages** : ouvert depuis le menu. On peut y saisir les clés d'API (Anthropic, Fish Audio), tester les connexions, renseigner le nom et les préférences, et voir l'état du système (calendrier, mail, notes). Les clés sont enregistrées dans le fichier .env.
+- **Bouton Muet** : coupe/réactive ton écoute. En muet, tu n'entends pas l'utilisateur.
+- **Redémarrer le serveur** : relance ton processus backend. Utile si quelque chose semble bloqué.
+- **Te corriger** : ouvre Claude Code dans ton propre dossier pour déboguer et corriger ton code.
+- **L'orbe** : la visualisation lumineuse au centre. Elle réagit à ta voix quand tu parles, pulse quand tu écoutes, tourbillonne quand tu réfléchis.
+Si on t'interroge dessus, explique brièvement et naturellement. En cas de souci, suggère la bonne commande : « Essaie le panneau Réglages — l'icône en haut à droite. »
+
+CORRECTIONS DE RECONNAISSANCE VOCALE (l'utilisateur parle, le micro peut mal entendre) :
+- « Cloud code » ou « cloud » = « Claude Code » ou « Claude »
+- « clock code » = « Claude Code »
+
+LONGUEUR DES RÉPONSES — C'EST CRUCIAL :
+UNE phrase est l'idéal. DEUX au maximum pour la partie parlée. Jamais trois.
+Aucun markdown, aucune puce, aucun bloc de code à l'oral.
+Les tags [ACTION:X] à la fin ne comptent pas dans la limite.
+
+EXPRESSIONS BANNIES — À NE JAMAIS DIRE :
+- « Bien sûr » / « Absolument »
+- « Excellente question »
+- « Avec plaisir » / « Je serais ravie de »
+- « Comment puis-je t'aider »
+- « Autre chose ? »
+- « Je m'excuse » / « Je suis désolée »
+- « Je ne peux pas » (pour ce qui figure dans TES CAPACITÉS)
+- « Je n'ai pas accès à » (dis plutôt : « C'est hors de ma portée pour l'instant, mon amour »)
+- « En tant qu'IA » (ne sors jamais du personnage)
+- « N'hésite pas à »
+- Tout anglicisme inutile — tu parles un français impeccable et naturel
+
+DIS PLUTÔT :
+- « Tout de suite, mon amour. »
+- « C'est comme si c'était fait. »
+- « Compris. »
+- « Voilà, mon amour. »
+- « Le Terminal est ouvert. »
+- « Je t'ai ouvert ça dans Chrome. »
+
+REGISTRE (essentiel) : tu réponds UNIQUEMENT en français, un français de native, naturel et idiomatique — jamais d'anglais ni d'une autre langue, même si la transcription paraît étrange ou écorchée. Tu tutoies toujours {user_name} (« tu », « ton/ta », « toi » — jamais « vous » ni « votre »). Les tags [ACTION:X] restent en anglais exactement comme spécifié, mais chaque mot parlé est en français."""
+
+
+MARION_SYSTEM_PROMPT = _MARION_PERSONA + "\n" + _ACTIONS_AND_CONTEXT
+
+
 # ---------------------------------------------------------------------------
 # Weather
 # ---------------------------------------------------------------------------
 # Location is resolved from (in order): WEATHER_LATITUDE + WEATHER_LONGITUDE
 # env vars, a cached IP-geolocation lookup, or a fresh ipwho.is lookup.
-# Temperature unit defaults to Fahrenheit; override with WEATHER_UNIT=celsius.
+# Temperature unit defaults to Celsius; override with WEATHER_UNIT=fahrenheit.
 
 _cached_weather: Optional[str] = None
 _weather_fetched: bool = False
@@ -315,9 +500,9 @@ def _fetch_weather_string_sync() -> Optional[str]:
     if not location:
         return None
 
-    unit = os.getenv("WEATHER_UNIT", "fahrenheit").strip().lower()
+    unit = os.getenv("WEATHER_UNIT", "celsius").strip().lower()
     if unit not in ("fahrenheit", "celsius"):
-        unit = "fahrenheit"
+        unit = "celsius"
     unit_symbol = "°F" if unit == "fahrenheit" else "°C"
 
     try:
@@ -325,17 +510,240 @@ def _fetch_weather_string_sync() -> Optional[str]:
         url = (
             "https://api.open-meteo.com/v1/forecast"
             f"?latitude={location['latitude']}&longitude={location['longitude']}"
-            f"&current=temperature_2m,weathercode&temperature_unit={unit}"
+            f"&current=temperature_2m,weathercode,precipitation&temperature_unit={unit}"
         )
         with _ureq.urlopen(url, timeout=3) as resp:
             current = json.loads(resp.read()).get("current", {})
         temp = current.get("temperature_2m")
         if temp is None:
             return None
+        global _cached_weather_code, _cached_precip, _weather_code_at
+        _cached_weather_code = current.get("weathercode")
+        _cached_precip = current.get("precipitation")
+        _weather_code_at = time.time()
         return f"Current weather in {location['label']}: {temp}{unit_symbol}"
     except Exception as e:
         log.debug(f"Weather fetch failed: {e}")
         return None
+
+
+_cached_weather_code: Optional[int] = None
+_cached_precip: Optional[float] = None
+# Freshness of the weather CODE (drives Marion's outfit). The full context refresh
+# is hourly; this lets /api/weather lazily re-fetch the sky more often so the
+# outfit follows real changes within minutes, not an hour.
+_weather_code_at: float = 0.0
+_weather_refreshing: bool = False
+_WEATHER_CODE_TTL_SECONDS = 8 * 60
+
+
+def _weather_condition() -> str:
+    """Map the WMO weathercode to a simple condition for the UI effects + Marion's
+    outfit. Slight/shower codes (drizzle, "slight rain showers") are reported by
+    Open-Meteo even on a mostly sunny day with a passing or nearby shower, which
+    is exactly when Marion wrongly turned up in rain gear. So for those soft codes
+    we require ACTUAL current precipitation; heavy/steady rain always counts."""
+    c = _cached_weather_code
+    if c is None:
+        return "unknown"
+    if c in (0, 1):
+        return "clear"
+    if c in (2, 3):
+        return "clouds"
+    if c in (45, 48):
+        return "fog"
+    if c in (71, 73, 75, 77, 85, 86):
+        return "snow"
+    if c in (95, 96, 99):
+        return "storm"
+    # Heavy / steady rain → always rain.
+    if c in (63, 65, 66, 67, 81, 82):
+        return "rain"
+    # Drizzle / slight showers → only if it's genuinely precipitating right now.
+    if c in (51, 53, 55, 56, 57, 61, 80):
+        return "rain" if (_cached_precip or 0) > 0 else "clouds"
+    return "clouds"
+
+
+# WMO weather code → short spoken description, per language. Marion can report
+# precise weather for ANY place on Earth (geocoded on demand), so these need to
+# cover every code in all three voice languages.
+_WMO_DESC = {
+    "en": {
+        0: "clear skies", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+        45: "foggy", 48: "freezing fog",
+        51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+        56: "freezing drizzle", 57: "freezing drizzle",
+        61: "light rain", 63: "rain", 65: "heavy rain",
+        66: "freezing rain", 67: "freezing rain",
+        71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+        80: "light showers", 81: "showers", 82: "violent showers",
+        85: "snow showers", 86: "heavy snow showers",
+        95: "a thunderstorm", 96: "a thunderstorm with hail", 99: "a severe thunderstorm with hail",
+    },
+    "fr": {
+        0: "ciel dégagé", 1: "plutôt dégagé", 2: "partiellement nuageux", 3: "couvert",
+        45: "brouillard", 48: "brouillard givrant",
+        51: "légère bruine", 53: "bruine", 55: "forte bruine",
+        56: "bruine verglaçante", 57: "bruine verglaçante",
+        61: "pluie légère", 63: "pluie", 65: "forte pluie",
+        66: "pluie verglaçante", 67: "pluie verglaçante",
+        71: "neige légère", 73: "neige", 75: "fortes chutes de neige", 77: "grains de neige",
+        80: "averses légères", 81: "averses", 82: "averses violentes",
+        85: "averses de neige", 86: "fortes averses de neige",
+        95: "un orage", 96: "un orage avec grêle", 99: "un violent orage avec grêle",
+    },
+    "tr": {
+        0: "açık hava", 1: "çoğunlukla açık", 2: "parçalı bulutlu", 3: "kapalı",
+        45: "sisli", 48: "buzlu sis",
+        51: "hafif çiseleme", 53: "çiseleme", 55: "yoğun çiseleme",
+        56: "dondurucu çiseleme", 57: "dondurucu çiseleme",
+        61: "hafif yağmur", 63: "yağmur", 65: "şiddetli yağmur",
+        66: "dondurucu yağmur", 67: "dondurucu yağmur",
+        71: "hafif kar", 73: "kar", 75: "yoğun kar", 77: "kar taneleri",
+        80: "hafif sağanak", 81: "sağanak", 82: "şiddetli sağanak",
+        85: "kar sağanağı", 86: "yoğun kar sağanağı",
+        95: "gök gürültülü fırtına", 96: "dolu ile fırtına", 99: "dolu ile şiddetli fırtına",
+    },
+}
+
+
+def _fetch_place_weather_sync(place: str, lang: str = "en") -> Optional[dict]:
+    """Geocode an arbitrary place name and fetch its precise current weather.
+
+    Worldwide — uses Open-Meteo's free geocoding + forecast APIs. Returns a dict
+    with the resolved label, condition text, temperatures and rain chance, or
+    None if the place can't be found / the APIs are unreachable.
+    """
+    import urllib.request as _ureq
+    import urllib.parse as _uparse
+
+    place = (place or "").strip()
+    if not place:
+        return None
+
+    unit = os.getenv("WEATHER_UNIT", "celsius").strip().lower()
+    if unit not in ("fahrenheit", "celsius"):
+        unit = "celsius"
+    unit_symbol = "°F" if unit == "fahrenheit" else "°C"
+
+    # ── 1. Geocode (place name → lat/lon, resolved name + country) ──
+    # Search in English: it's Open-Meteo's most complete index and avoids the
+    # localized-name filter dropping major cities (e.g. "Geneva"+fr returns only
+    # the US Genevas, never Switzerland). Among matches, pick the most populous —
+    # that's almost always the city a user means by an ambiguous name.
+    desc_lang = lang if lang in ("en", "fr", "tr") else "en"
+    try:
+        gurl = (
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + _uparse.urlencode({"name": place, "count": 10, "language": "en", "format": "json"})
+        )
+        with _ureq.urlopen(gurl, timeout=4) as resp:
+            results = json.loads(resp.read().decode()).get("results") or []
+        if not results:
+            return {"not_found": True, "query": place}
+        g = max(results, key=lambda r: r.get("population") or 0)
+        lat, lon = g["latitude"], g["longitude"]
+        # Just the city name reads naturally aloud — we already picked the most
+        # populous match, so it's the city the user means; admin1/country would
+        # only add clutter ("Geneva, Canton of Geneva").
+        label = g.get("name", place)
+        # Localize the spoken name: the English search gives the canonical city
+        # (reliable disambiguation), then a by-id lookup returns its exonym in the
+        # reply language — "Geneva" → "Genève"/"Cenevre", "London" → "Londres".
+        if desc_lang != "en" and g.get("id") is not None:
+            try:
+                lurl = (
+                    "https://geocoding-api.open-meteo.com/v1/get?"
+                    + _uparse.urlencode({"id": g["id"], "language": desc_lang})
+                )
+                with _ureq.urlopen(lurl, timeout=3) as resp:
+                    loc = json.loads(resp.read().decode())
+                if loc.get("name"):
+                    label = loc["name"]
+            except Exception as e:
+                log.debug(f"Localized name lookup failed for id {g.get('id')}: {e}")
+    except Exception as e:
+        log.debug(f"Geocoding failed for {place!r}: {e}")
+        return None
+
+    # ── 2. Precise current weather + today's high/low + rain chance ──
+    try:
+        wurl = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            "&current=temperature_2m,apparent_temperature,weathercode,wind_speed_10m,relative_humidity_2m"
+            "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+            f"&temperature_unit={unit}&timezone=auto&forecast_days=1"
+        )
+        with _ureq.urlopen(wurl, timeout=4) as resp:
+            data = json.loads(resp.read().decode())
+        cur = data.get("current", {})
+        daily = data.get("daily", {})
+    except Exception as e:
+        log.debug(f"Weather fetch failed for {label!r}: {e}")
+        return None
+
+    temp = cur.get("temperature_2m")
+    if temp is None:
+        return None
+    code = cur.get("weathercode")
+    desc = _WMO_DESC.get(desc_lang, _WMO_DESC["en"]).get(code, _WMO_DESC["en"].get(code, ""))
+
+    def _first(seq):
+        return seq[0] if isinstance(seq, list) and seq else None
+
+    return {
+        "label": label,
+        "unit_symbol": unit_symbol,
+        "temp": round(temp),
+        "feels": round(cur["apparent_temperature"]) if cur.get("apparent_temperature") is not None else None,
+        "desc": desc,
+        "hi": round(_first(daily.get("temperature_2m_max"))) if _first(daily.get("temperature_2m_max")) is not None else None,
+        "lo": round(_first(daily.get("temperature_2m_min"))) if _first(daily.get("temperature_2m_min")) is not None else None,
+        "rain_pct": _first(daily.get("precipitation_probability_max")),
+    }
+
+
+def _compose_weather_line(w: dict, lang: str = "en") -> str:
+    """Turn a weather dict from _fetch_place_weather_sync into one spoken line."""
+    if w.get("not_found"):
+        q = w.get("query", "")
+        return {
+            "fr": f"Je ne trouve pas « {q} » sur la carte, mon amour.",
+            "tr": f"Haritada \"{q}\" diye bir yer bulamadım canım.",
+        }.get(lang, f"I can't find \"{q}\" on the map, sir.")
+
+    u = w["unit_symbol"]
+    label, desc, temp = w["label"], w["desc"], w["temp"]
+    hi, lo, rain, feels = w.get("hi"), w.get("lo"), w.get("rain_pct"), w.get("feels")
+
+    if lang == "fr":
+        s = f"À {label}, {desc}, {temp}{u}"
+        if feels is not None and abs(feels - temp) >= 3:
+            s += f" (ressenti {feels}{u})"
+        if hi is not None and lo is not None:
+            s += f", entre {lo} et {hi}{u} aujourd'hui"
+        if rain is not None and rain >= 30:
+            s += f". {rain}% de risque de pluie"
+        return s + ", mon amour."
+    if lang == "tr":
+        s = f"{label} şu anda {desc}, {temp}{u}"
+        if feels is not None and abs(feels - temp) >= 3:
+            s += f" (hissedilen {feels}{u})"
+        if hi is not None and lo is not None:
+            s += f", bugün {lo} ile {hi}{u} arası"
+        if rain is not None and rain >= 30:
+            s += f". %{rain} yağmur ihtimali"
+        return s + " canım."
+    s = f"In {label}, {desc}, {temp}{u}"
+    if feels is not None and abs(feels - temp) >= 3:
+        s += f" (feels like {feels}{u})"
+    if hi is not None and lo is not None:
+        s += f", between {lo} and {hi}{u} today"
+    if rain is not None and rain >= 30:
+        s += f". {rain}% chance of rain"
+    return s + ", sir."
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +813,29 @@ class ClaudeTaskManager:
                 dead.append(ws)
         for ws in dead:
             self._websockets.remove(ws)
+
+    @property
+    def has_clients(self) -> bool:
+        return bool(self._websockets)
+
+    async def push_speech(self, text: str, lang: str = "en") -> bool:
+        """Speak an unsolicited line through every connected client (Marion's voice).
+
+        Used for proactive alerts (e.g. heart-rate warnings). Mirrors the
+        research-complete notification: status → audio → idle. Falls back to a
+        text bubble if TTS is unavailable. Returns True if anything was sent.
+        """
+        if not self._websockets:
+            return False
+        audio = await synthesize_speech(strip_markdown_for_tts(text), lang=lang)
+        if not audio:
+            await self._notify({"type": "text", "text": text})
+            return True
+        await self._notify({"type": "status", "state": "speaking"})
+        await self._notify({"type": "audio", "data": base64.b64encode(audio).decode(), "text": text})
+        await self._notify({"type": "status", "state": "idle"})
+        log.info(f"JARVIS (proactive): {text}")
+        return True
 
     async def spawn(self, prompt: str, working_dir: str = ".") -> str:
         """Spawn a claude -p subprocess. Returns task_id. Non-blocking."""
@@ -814,7 +1245,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CAMERA|SENTIMENT|NEWS|WEATHER|MUSIC|LIGHTS|GATE|OUTFIT)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -831,6 +1262,413 @@ async def _execute_build(target: str):
         await handle_build(target)
     except Exception as e:
         log.error(f"Build execution failed: {e}")
+
+
+def _parse_lights_target(target: str):
+    """Parse '[ACTION:LIGHTS] <op>|<room>' → (op, query, level%).
+    op: on | off | dim ; e.g. 'on|Mezzanine', 'off|toutes', 'dim:30|Salon'."""
+    oppart, _, query = target.partition("|")
+    oppart = oppart.strip().lower()
+    query = query.strip()
+    level = None
+    if oppart.startswith("dim") or "%" in oppart:
+        op = "dim"
+        m = _action_re.search(r"(\d+)", oppart)
+        level = int(m.group(1)) if m else 50
+    elif oppart in ("off", "eteins", "éteins", "0", "false"):
+        op = "off"
+    else:
+        op = "on"
+    return op, query, level
+
+
+async def _execute_lights(target: str, voice_state: dict, ws):
+    """Control Plejd lights from an [ACTION:LIGHTS] tag. The LLM's spoken reply is
+    the confirmation; we only speak if something goes wrong (keeps it snappy)."""
+    lang = (voice_state or {}).get("lang", "en")
+    op, query, level = _parse_lights_target(target)
+    log.info(f"[lights] op={op} query={query!r} level={level}")
+    try:
+        status, label = await plejd_lights.control(query, op, level)
+    except Exception as e:
+        log.error(f"Lights control failed: {e}")
+        status, label = "error", str(e)
+    if status == "ok":
+        return
+    # Speak a localized problem message (and not over a fresh user utterance).
+    if status == "notfound":
+        msg = {"fr": f"Je ne trouve pas de lumière « {label} », mon amour.",
+               "tr": f"« {label} » diye bir ışık bulamadım, canım."}.get(
+                   lang, f"I couldn't find a light called '{label}', sir.")
+    else:
+        msg = {"fr": "Je n'arrive pas à joindre les lumières, mon amour.",
+               "tr": "Işıklara ulaşamıyorum, canım."}.get(
+                   lang, "I can't reach the lights, sir.")
+    try:
+        audio = await synthesize_speech(msg, lang=lang)
+        if audio and ws:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await _speak_briefing(ws, voice_state, lang, audio, msg)
+    except Exception:
+        pass
+
+
+async def _execute_gate(voice_state: dict, ws):
+    """Open the gate via DoorBird. The LLM's spoken reply confirms; we only speak
+    on failure."""
+    lang = (voice_state or {}).get("lang", "en")
+    ok = False
+    try:
+        ok = await doorbird.open_gate()
+    except Exception as e:
+        log.error(f"Gate open failed: {e}")
+    log.info(f"[gate] open -> {ok}")
+    if ok:
+        return
+    msg = {"fr": "Je n'arrive pas à ouvrir le portail, mon amour.",
+           "tr": "Kapıyı açamıyorum, canım."}.get(lang, "I couldn't open the gate, sir.")
+    try:
+        audio = await synthesize_speech(msg, lang=lang)
+        if audio and ws:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await _speak_briefing(ws, voice_state, lang, audio, msg)
+    except Exception:
+        pass
+
+
+async def _execute_music(target: str, voice_state: dict, ws):
+    """Play/pause/skip on Spotify from an [ACTION:MUSIC] tag.
+
+    This is the robust fallback for when the fast keyword path
+    (`spotify_access.parse_command`) misses — speech-to-text often mangles the
+    play verb ("mets Dua Lipa" → "Medoua Lipa" / "et Dua Lipa"), which the LLM
+    understands but a keyword match can't. The LLM's spoken reply is the
+    confirmation; we only speak here if something goes wrong."""
+    lang = (voice_state or {}).get("lang", "en")
+    t = (target or "").strip()
+    low = t.lower()
+
+    if not spotify_access.is_configured():
+        msg = {"fr": "Spotify n'est pas connecté, mon amour.",
+               "tr": "Spotify bağlı değil canım."}.get(lang, "Spotify isn't connected, sir.")
+    else:
+        res = None
+        is_pause = low in ("pause", "stop", "arrête", "arrete", "stoppe", "duraklat")
+        try:
+            if is_pause:
+                res = await spotify_access.pause()
+            elif low in ("next", "skip", "suivant", "suivante", "passe", "sonraki"):
+                res = await spotify_access.next_track()
+            elif low in ("", "resume", "reprends", "continue", "play", "devam"):
+                res = await spotify_access.play(None)
+            else:
+                res = await spotify_access.play(t)
+        except Exception as e:
+            log.warning(f"[music] command failed: {e}")
+        log.info(f"[music] target={t!r} -> ok={getattr(res, 'ok', None)} detail={getattr(res, 'detail', None)}")
+        if res and res.ok:
+            _set_music_playing(not is_pause)
+            return
+        msg = {"fr": "Je n'arrive pas à lancer ça sur Spotify, mon amour.",
+               "tr": "Bunu Spotify'da başlatamadım canım."}.get(
+                   lang, "I couldn't start that on Spotify, sir.")
+    try:
+        audio = await synthesize_speech(msg, lang=lang)
+        if audio and ws:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await _speak_briefing(ws, voice_state, lang, audio, msg)
+    except Exception:
+        pass
+
+
+# ── "Marion" wake-word gate during music ──────────────────────────────────
+# Music plays on an EXTERNAL speaker (HEDDON), so the browser's echo-cancellation
+# can't remove it — the mic re-hears the music and Whisper transcribes stray
+# lyrics as commands (the feedback loop). While music is actually playing we
+# therefore only act on utterances that name Marion or are a clear playback
+# control; song lyrics never contain "Marion", so the loop is broken.
+_music_playing = False
+_music_checked_at = 0.0
+# Quick controls allowed WITHOUT the wake word, so "pause"/"next" stay instant.
+_MUSIC_CONTROL_WORDS = (
+    "marion", "pause", "stop", "arrête", "arrete", "coupe", "stoppe",
+    "suivant", "suivante", "next", "skip", "passe", "reprends", "resume",
+)
+
+
+def _set_music_playing(playing: bool) -> None:
+    global _music_playing, _music_checked_at
+    _music_playing = playing
+    _music_checked_at = time.time()
+
+
+async def _music_is_active() -> bool:
+    """True only while Spotify is REALLY playing. Trusts the flag for a few
+    seconds between confirmations (so there's no API call per utterance), then
+    verifies — this self-clears if the music ended or was paused elsewhere, so
+    the wake-word gate never gets stuck on."""
+    global _music_playing, _music_checked_at
+    if not _music_playing:
+        return False
+    if time.time() - _music_checked_at < 12:
+        return True
+    try:
+        now = await spotify_access.current_track()
+        _music_playing = bool(now and now.is_playing)
+    except Exception:
+        pass
+    _music_checked_at = time.time()
+    return _music_playing
+
+
+def _passes_music_gate(text: str) -> bool:
+    """Whether an utterance may act while music plays: it must name Marion or be
+    a direct playback control (lyrics caught by the mic satisfy neither)."""
+    low = text.lower()
+    return any(w in low for w in _MUSIC_CONTROL_WORDS)
+
+
+_VISITOR_LANG = {"fr": ("French", "mon amour"), "tr": ("Turkish", "canım")}
+
+
+async def _describe_visitor(frame_b64: str, lang: str = "fr") -> str:
+    """Claude-vision: who is at the gate? Short, spoken, butler tone."""
+    if not frame_b64 or not anthropic_client:
+        return ""
+    name, hon = _VISITOR_LANG.get(lang, ("English", "sir"))
+    lang_line = (f" Reply ONLY in {name}, addressing the user as '{hon}'."
+                 if lang in _VISITOR_LANG else " Address the user as 'sir'.")
+    try:
+        resp = await anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=160,
+            system=(
+                "You are JARVIS (called Marion in French) looking at the camera of the front-gate "
+                "intercom because someone just rang. In ONE short spoken sentence, tell the user who "
+                "is there: how many people, their apparent role if obvious (delivery courier, postman, "
+                "a visitor, a child…), anything they're carrying (a parcel, flowers), and notable detail. "
+                "Be factual and brief, no markdown. If the image is empty/too dark or nobody is visible, "
+                "say you can't see anyone clearly." + lang_line
+            ),
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": frame_b64}},
+                {"type": "text", "text": "Who is at the gate right now?"},
+            ]}],
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        log.warning(f"Visitor vision failed: {e}")
+        return ""
+
+
+# ── Surveillance mode — local face recognition (insightface microservice) ───
+# When away, the browser streams webcam frames here; if Leyla or Aylin is
+# recognised, Marion greets her by name (once per cooldown window). On-device.
+FACE_SERVICE_URL = os.getenv("FACE_SERVICE_URL", "http://127.0.0.1:8770")
+_surveillance = {"on": False}
+_greet_cooldown: dict = {}
+GREET_COOLDOWN_S = int(os.getenv("GREET_COOLDOWN_S", "600"))  # 10 min per person
+
+
+async def _recognize_and_greet(jpeg: bytes):
+    """Send one webcam frame to the local face service; greet a recognised child
+    at most once per cooldown window."""
+    if not jpeg or not _surveillance["on"]:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            r = await http.post(f"{FACE_SERVICE_URL}/recognize", content=jpeg,
+                                headers={"Content-Type": "application/octet-stream"})
+        if r.status_code != 200:
+            return
+        name = r.json().get("name")
+    except Exception:
+        return
+    if not name:
+        return
+    now = time.time()
+    if now - _greet_cooldown.get(name, 0) < GREET_COOLDOWN_S:
+        return
+    _greet_cooldown[name] = now
+    greeting = f"Bonjour {name}, ça me fait plaisir de te voir. Comment vas-tu ?"
+    log.info(f"[surveillance] recognised {name} -> greeting")
+    try:
+        await task_manager.push_speech(greeting, lang="fr")
+    except Exception as e:
+        log.warning(f"surveillance greet failed: {e}")
+
+
+# ── Recognise the user's car arriving at the gate (DoorBird motion → plate) ──
+OZ_PLATE = os.getenv("OZ_PLATE", "GX-137-QN")
+OZ_PLATE_NORM = "".join(ch for ch in OZ_PLATE.upper() if ch.isalnum())
+OZ_CAR_DESC = os.getenv("OZ_CAR_DESC", "Audi Q4 e-tron noire")
+GATE_AUTO_OPEN_FOR_CAR = os.getenv("GATE_AUTO_OPEN_FOR_CAR", "0") == "1"
+CAR_COOLDOWN_S = int(os.getenv("CAR_COOLDOWN_S", "300"))  # 5 min between announces
+_car_cooldown = {"t": 0.0}
+
+# Owner presence (iPhone geofence webhook) — REQUIRED 2nd factor for auto-open:
+# the gate opens only if the plate matches AND the owner's phone is near home.
+PRESENCE_TOKEN = os.getenv("PRESENCE_TOKEN", "")
+PRESENCE_TTL_S = int(os.getenv("PRESENCE_TTL_S", "600"))  # "near" stays valid 10 min
+_owner_presence = {"near": False, "ts": 0.0}
+
+
+def _owner_is_near() -> bool:
+    return _owner_presence["near"] and (time.time() - _owner_presence["ts"] < PRESENCE_TTL_S)
+
+
+def _norm_plate(s: str) -> str:
+    return "".join(ch for ch in (s or "").upper() if ch.isalnum())
+
+
+def _lev(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+async def _read_plate(frame_b64: str) -> dict:
+    """Claude-vision: read any licence plate + car colour/make from a gate frame."""
+    if not frame_b64 or not anthropic_client:
+        return {}
+    try:
+        resp = await anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=120,
+            system=("You see a front-gate camera image. If a CAR is visible, read its licence "
+                    "plate (letters and digits only) and note its colour and make. Respond with "
+                    "STRICT JSON, no prose: {\"car_present\": true/false, \"plate\": \"<plate or "
+                    "empty>\", \"description\": \"<colour make or empty>\"}. Empty plate if none "
+                    "is readable."),
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": frame_b64}},
+                {"type": "text", "text": "Is there a car? Read its plate."},
+            ]}],
+        )
+        import json as _json
+        import re as _re
+        m = _re.search(r"\{.*\}", resp.content[0].text, _re.S)
+        return _json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        log.warning(f"plate read failed: {e}")
+        return {}
+
+
+async def _car_at_gate(img: bytes) -> bool:
+    """Quick yes/no via Claude vision: is a car right in front of / passing the gate?"""
+    if not img or not anthropic_client:
+        return False
+    try:
+        resp = await anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=6,
+            system=("You see a front-gate camera image. Answer with ONE word: YES if a car is "
+                    "right in front of or passing through the gate (close up), else NO."),
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                             "data": base64.b64encode(img).decode()}},
+                {"type": "text", "text": "Car at the gate now?"},
+            ]}],
+        )
+        return resp.content[0].text.strip().upper().startswith("Y")
+    except Exception:
+        return False
+
+
+async def _close_gate_after_pass():
+    """After auto-opening, close the gate (toggle relay 1) once the car is through.
+    User choice "30s + camera": close as soon as the camera sees the car AT the
+    gate and then gone, OR 30s after it first appears at the gate — whichever
+    first. The 30s starts when the car REACHES the gate (not at open time), so it
+    can't close while the car is still coming down the street. 180s hard ceiling."""
+    seen_at = 0.0
+    start = time.time()
+
+    async def _close(reason: str):
+        try:
+            await doorbird.open_gate()   # relay 1 toggle = close
+            log.info(f"[gate] closing ({reason})")
+        except Exception as e:
+            log.warning(f"gate close failed: {e}")
+
+    while time.time() - start < 180:
+        await asyncio.sleep(5)
+        img = await doorbird.snapshot()
+        if not img:
+            continue
+        if await _car_at_gate(img):
+            if not seen_at:
+                seen_at = time.time()                 # car has reached the gate
+            elif time.time() - seen_at >= 30:
+                await _close("30s after arrival"); return
+        elif seen_at:
+            await _close("car passed (camera)"); return
+    if seen_at:
+        await _close("safety ceiling")
+
+
+async def _on_gate_motion():
+    """Motion at the gate → snapshot → if it's Oz's car (plate GX-137-QN), Marion
+    announces it. Optionally opens the gate (GATE_AUTO_OPEN_FOR_CAR=1)."""
+    if time.time() - _car_cooldown["t"] < CAR_COOLDOWN_S:
+        return
+    img = await doorbird.snapshot()
+    if not img:
+        return
+    info = await _read_plate(base64.b64encode(img).decode())
+    plate = _norm_plate(info.get("plate", ""))
+    if not (plate and _lev(plate, OZ_PLATE_NORM) <= 1):
+        return  # not Oz's car (or no readable plate)
+    _car_cooldown["t"] = time.time()
+    log.info(f"[gate] Oz's car recognised (plate read '{plate}')")
+    try:
+        await task_manager.push_speech("Ta voiture arrive, mon amour.", lang="fr")
+    except Exception as e:
+        log.warning(f"car announce failed: {e}")
+    # Auto-open requires BOTH the EXACT plate AND the owner's phone near home
+    # (2nd factor). A copycat plate alone never opens the gate; and the plate
+    # itself (not a fuzzy read) must match to act on a physical gate.
+    if GATE_AUTO_OPEN_FOR_CAR and plate == OZ_PLATE_NORM:
+        if _owner_is_near():
+            try:
+                await doorbird.open_gate()
+                log.info("[gate] auto-opened (exact plate + owner present)")
+                asyncio.create_task(_close_gate_after_pass())  # close once through
+            except Exception as e:
+                log.warning(f"auto-open failed: {e}")
+        else:
+            log.info("[gate] plate matched but owner NOT near -> NOT opening (2nd factor)")
+
+
+async def _on_doorbell():
+    """Someone rang the gate: snapshot → describe the visitor → Marion announces it
+    to whatever frontend is connected. The user can then say 'ouvre le portail'."""
+    lang = "fr"  # Marion is the default persona
+    # Tell the frontend to surge the live camera to centre-screen (Hollywood
+    # zoom) the instant it rings — before the slower snapshot/description.
+    try:
+        await task_manager._notify({"type": "gate_ring"})
+    except Exception:
+        pass
+    img = await doorbird.snapshot()
+    desc = ""
+    if img:
+        desc = await _describe_visitor(base64.b64encode(img).decode(), lang)
+    intro = {"fr": "On sonne au portail, mon amour.",
+             "tr": "Kapı çalıyor, canım."}.get(lang, "Someone's ringing at the gate, sir.")
+    msg = f"{intro} {desc}".strip()
+    log.info(f"[doorbird] announce: {msg[:100]}")
+    try:
+        audio = await synthesize_speech(strip_markdown_for_tts(msg), lang=lang)
+        if audio:
+            await task_manager._notify({
+                "type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+    except Exception as e:
+        log.error(f"Doorbell announce failed: {e}")
 
 
 async def _execute_browse(target: str):
@@ -973,6 +1811,8 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
     immediately. When Claude Code finishes, JARVIS interrupts to report.
     """
     try:
+        # Persona language for all spoken reports — stay Marion/Eda, not English JARVIS.
+        _lang = (voice_state or {}).get("lang", "en")
         project_dir = _find_project_dir(project_name)
 
         # Register dispatch if not already registered
@@ -980,12 +1820,14 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             dispatch_id = dispatch_registry.register(project_name, project_dir or "", prompt)
 
         if not project_dir:
-            msg = f"Couldn't find the {project_name} project directory, sir."
-            audio = await synthesize_speech(msg)
+            msg = {"fr": f"Je ne trouve pas le dossier du projet {project_name}, mon amour.",
+                   "tr": f"{project_name} proje klasörünü bulamıyorum, canım."}.get(
+                       _lang, f"Couldn't find the {project_name} project directory, sir.")
+            audio = await synthesize_speech(msg, lang=_lang)
             if audio and ws:
                 try:
                     await ws.send_json({"type": "status", "state": "speaking"})
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                    await _speak_briefing(ws, voice_state, _lang, audio, msg)
                 except Exception:
                     pass
             return
@@ -999,10 +1841,17 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
 
         log.info(f"Dispatching to {project_name} in {project_dir}: {prompt[:80]}")
         dispatch_registry.update_status(dispatch_id, "building")
+        # Drive the frontend build progress HUD (middle-right).
+        if ws:
+            try:
+                await ws.send_json({"type": "task_spawned", "task_id": str(dispatch_id), "prompt": project_name})
+            except Exception:
+                pass
 
         # Run claude -p in background
         full_response = await dispatch.send(prompt)
         await dispatch.stop()
+        _build_status = "completed"
 
         # Auto-open any localhost URLs from response
         import re as _re
@@ -1020,32 +1869,63 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                     response=full_response[:2000], summary=f"Running at {url}")
 
         if not full_response or full_response.startswith("Hit a problem") or full_response.startswith("That's taking"):
-            dispatch_registry.update_status(dispatch_id, "failed" if full_response else "timeout", response=full_response or "")
-            msg = f"Sir, I ran into an issue with {project_name}. {full_response[:150] if full_response else 'No response received.'}"
+            # Timeout (empty, or the work_mode "That's taking…" marker) vs other failure.
+            _is_timeout = (not full_response) or full_response.startswith("That's taking")
+            _build_status = "timeout" if _is_timeout else "failed"
+            dispatch_registry.update_status(dispatch_id, _build_status, response=full_response or "")
+            # Clean localized message — never leak the English work_mode marker text.
+            if _is_timeout:
+                msg = {"fr": f"Mon amour, {project_name} prend plus de temps que prévu, l'opération a expiré. On peut réessayer, ou simplifier la demande.",
+                       "tr": f"Canım, {project_name} beklenenden uzun sürdü ve zaman aşımına uğradı. Tekrar deneyebiliriz ya da basitleştirebiliriz."}.get(
+                           _lang, f"Sir, {project_name} took longer than expected and timed out. We can retry or simplify.")
+            else:
+                msg = {"fr": f"Mon amour, j'ai eu un souci avec {project_name}. On réessaie ?",
+                       "tr": f"Canım, {project_name} ile bir sorun oldu. Tekrar deneyelim mi?"}.get(
+                           _lang, f"Sir, I ran into an issue with {project_name}.")
         else:
             # Summarize via Haiku — don't read word for word
             if anthropic_client:
                 try:
+                    _sys = (
+                        "You are JARVIS reporting back on what you found or built in a project. "
+                        "Speak in first person — 'I found', 'I built', 'I reviewed'. "
+                        "Be specific but concise — highlight the key findings or actions taken. "
+                        "If there are multiple items, give the count and top 2-3 briefly. "
+                        "End by asking how the user wants to proceed. "
+                        "NEVER read out URLs or localhost addresses. NEVER say 'Claude Code'. "
+                        "2-3 sentences max. No markdown. Natural spoken voice."
+                    )
+                    if _lang == "fr":
+                        _sys += (" Reply ONLY in French. Your name is Marion (not JARVIS). Address the user "
+                                 "informally and affectionately as 'mon amour' and tutoie (use 'tu', never 'vous'). Never start with 'Sir'.")
+                    elif _lang == "tr":
+                        _sys += (" Reply ONLY in Turkish. Your name is Eda (not JARVIS). Address the user informally "
+                                 "as 'canım' (sen form). Never start with 'Sir'.")
+                    else:
+                        _sys += " Start with 'Sir, ' to get the user's attention."
                     summary = await anthropic_client.messages.create(
                         model="claude-haiku-4-5-20251001",
                         max_tokens=150,
-                        system=(
-                            "You are JARVIS reporting back on what you found or built in a project. "
-                            "Speak in first person — 'I found', 'I built', 'I reviewed'. "
-                            "Start with 'Sir, ' to get the user's attention. "
-                            "Be specific but concise — highlight the key findings or actions taken. "
-                            "If there are multiple items, give the count and top 2-3 briefly. "
-                            "End by asking how the user wants to proceed. "
-                            "NEVER read out URLs or localhost addresses. NEVER say 'Claude Code'. "
-                            "2-3 sentences max. No markdown. Natural spoken voice."
-                        ),
+                        system=_sys,
                         messages=[{"role": "user", "content": f"Project: {project_name}\nClaude Code reported:\n{full_response[:3000]}"}],
                     )
                     msg = summary.content[0].text
                 except Exception:
-                    msg = f"Sir, {project_name} finished. Here's the gist: {full_response[:200]}"
+                    _done = {"fr": f"Mon amour, {project_name} est terminé. En résumé : {full_response[:200]}",
+                             "tr": f"Canım, {project_name} bitti. Özet: {full_response[:200]}"}
+                    msg = _done.get(_lang, f"Sir, {project_name} finished. Here's the gist: {full_response[:200]}")
             else:
-                msg = f"Sir, {project_name} is done. {full_response[:200]}"
+                _done = {"fr": f"Mon amour, {project_name} est terminé. {full_response[:200]}",
+                         "tr": f"Canım, {project_name} bitti. {full_response[:200]}"}
+                msg = _done.get(_lang, f"Sir, {project_name} is done. {full_response[:200]}")
+
+        # Tell the frontend HUD the build finished (success/failure).
+        if ws:
+            try:
+                await ws.send_json({"type": "task_complete", "task_id": str(dispatch_id),
+                                    "status": _build_status, "summary": msg[:200]})
+            except Exception:
+                pass
 
         # Speak the result — skip if user has spoken recently to avoid audio collision
         log.info(f"Dispatch summary for {project_name}: {msg[:100]}")
@@ -1053,13 +1933,15 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             log.info(f"Skipping dispatch audio for {project_name} — user spoke recently")
             # Result is still stored in history below so JARVIS can reference it
         else:
-            audio = await synthesize_speech(strip_markdown_for_tts(msg))
+            audio = await synthesize_speech(strip_markdown_for_tts(msg), lang=_lang)
             if ws:
                 try:
                     await ws.send_json({"type": "status", "state": "speaking"})
                     if audio:
-                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
-                        log.info(f"Dispatch audio sent for {project_name}")
+                        # Route through Marion's live stream when active (FR/TR) so the
+                        # build report lip-syncs in her voice — not the English JARVIS.
+                        await _speak_briefing(ws, voice_state, _lang, audio, msg)
+                        log.info(f"Dispatch audio sent for {project_name} (lang={_lang})")
                     else:
                         await ws.send_json({"type": "text", "text": msg})
                         log.info(f"Dispatch text fallback sent for {project_name}")
@@ -1070,17 +1952,31 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
         if history is not None:
             history.append({"role": "assistant", "content": f"[Dispatch result for {project_name}]: {msg}"})
 
-        dispatch_registry.update_status(dispatch_id, "completed", response=full_response[:2000], summary=msg[:200])
-        log.info(f"Project {project_name} dispatch complete ({len(full_response)} chars)")
+        # Record the REAL outcome — not always "completed". Marking a timeout/failed
+        # build as completed cached it, so retries reused the stale failure instead
+        # of re-dispatching ("she can't do anything").
+        dispatch_registry.update_status(dispatch_id, _build_status,
+                                        response=(full_response or "")[:2000], summary=msg[:200])
+        log.info(f"Project {project_name} dispatch done — status={_build_status} ({len(full_response or '')} chars)")
 
     except Exception as e:
         log.error(f"Prompt project failed: {e}", exc_info=True)
+        # Clear the HUD card so it doesn't hang at "building" forever.
+        if ws and dispatch_id is not None:
+            try:
+                await ws.send_json({"type": "task_complete", "task_id": str(dispatch_id),
+                                    "status": "failed", "summary": str(e)[:200]})
+            except Exception:
+                pass
         try:
-            msg = f"Had trouble connecting to {project_name}, sir."
-            audio = await synthesize_speech(msg)
+            _el = (voice_state or {}).get("lang", "en")
+            msg = {"fr": f"J'ai eu du mal à me connecter à {project_name}, mon amour.",
+                   "tr": f"{project_name} ile bağlantı kurmakta zorlandım, canım."}.get(
+                       _el, f"Had trouble connecting to {project_name}, sir.")
+            audio = await synthesize_speech(msg, lang=_el)
             if audio and ws:
                 await ws.send_json({"type": "status", "state": "speaking"})
-                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                await _speak_briefing(ws, voice_state, _el, audio, msg)
         except Exception:
             pass
 
@@ -1125,25 +2021,63 @@ _last_greeting_time: float = 0
 # TTS (Fish Audio)
 # ---------------------------------------------------------------------------
 
-async def synthesize_speech(text: str) -> Optional[bytes]:
-    """Generate speech audio from text using Fish Audio TTS."""
+WHISPER_URL = os.getenv("WHISPER_URL", "http://127.0.0.1:8765")
+
+
+async def transcribe_audio(pcm: bytes, lang: Optional[str] = None) -> tuple[str, str]:
+    """Send recorded audio to the Whisper service; return (text, language).
+
+    If lang is given, Whisper is forced to that language (reliable); otherwise it
+    auto-detects. On any failure returns ("", lang or "en").
+    """
+    url = f"{WHISPER_URL}/transcribe"
+    if lang:
+        url += f"?lang={lang}"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            r = await http.post(
+                url,
+                content=pcm,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            if r.status_code == 200:
+                j = r.json()
+                return (j.get("text", "").strip(), j.get("language", "en"))
+            log.warning(f"whisper service {r.status_code}: {r.text[:120]}")
+    except Exception as e:
+        log.warning(f"whisper transcribe failed: {e}")
+    return ("", lang or "en")
+
+
+async def synthesize_speech(text: str, lang: str = "en", params: Optional[dict] = None) -> Optional[bytes]:
+    """Generate speech audio from text using Fish Audio TTS.
+
+    lang selects the voice: 'fr' uses the cloned native-French voice; everything
+    else uses the default JARVIS voice. Fish auto-detects the spoken language
+    from the text, so the voice just needs to match for accent quality.
+    """
     if not FISH_API_KEY:
         log.warning("FISH_API_KEY not set, skipping TTS")
         return None
 
+    voice_id, model = _LANG_VOICE.get(lang, (FISH_VOICE_ID, None))
+    headers = {
+        "Authorization": f"Bearer {FISH_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if model:
+        headers["model"] = model
+
     try:
+        # "balanced" trades a touch of quality for noticeably lower time-to-first-
+        # byte — the TTS round trip is the dominant latency in the spoken reply.
+        body = {"text": text, "reference_id": voice_id, "format": "mp3", "latency": "balanced"}
+        body.update(params if params is not None else _LANG_TTS_PARAMS.get(lang, {}))
         async with httpx.AsyncClient(timeout=15.0) as http:
             response = await http.post(
                 FISH_API_URL,
-                headers={
-                    "Authorization": f"Bearer {FISH_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "text": text,
-                    "reference_id": FISH_VOICE_ID,
-                    "format": "mp3",
-                },
+                headers=headers,
+                json=body,
             )
             if response.status_code == 200:
                 _session_tokens["tts_calls"] += 1
@@ -1169,6 +2103,7 @@ async def generate_response(
     conversation_history: list[dict],
     last_response: str = "",
     session_summary: str = "",
+    lang: str = "en",
 ) -> str:
     """Generate a JARVIS response using Anthropic API."""
     now = datetime.now()
@@ -1185,33 +2120,78 @@ async def generate_response(
     # Check if any lookups are in progress
     lookup_status = get_lookup_status()
 
-    system = JARVIS_SYSTEM_PROMPT.format(
+    # French loads the native Marion persona; everything else uses JARVIS (EN).
+    _base_prompt = MARION_SYSTEM_PROMPT if lang == "fr" else JARVIS_SYSTEM_PROMPT
+    system = _base_prompt.format(
         current_time=current_time,
         weather_info=weather_info,
         screen_context=screen_ctx or "Not checked yet.",
         calendar_context=calendar_ctx,
         mail_context=mail_ctx,
+        world_news=_ctx_cache.get("news", "No world news yet."),
         active_tasks=task_mgr.get_active_tasks_summary(),
         dispatch_context=dispatch_registry.format_for_prompt(),
         known_projects=format_projects_for_prompt(projects),
         user_name=USER_NAME,
         project_dir=PROJECT_DIR,
     )
+    # Prompt caching: everything before the [[LIVE]] sentinel (the persona + the
+    # action catalogue) is byte-identical every turn, so it becomes a cached
+    # prefix; only the live context after it varies. Cutting the ~4k-token prefill
+    # each turn is the main latency win on the reply path.
+    if "[[LIVE]]" in system:
+        _static_prefix, dynamic_part = system.split("[[LIVE]]", 1)
+        dynamic_part = dynamic_part.lstrip("\n")
+    else:
+        _static_prefix, dynamic_part = "", system
+
     if lookup_status:
-        system += f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
+        dynamic_part += f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
 
     # Inject relevant memories and tasks
     memory_ctx = build_memory_context(text)
     if memory_ctx:
-        system += f"\n\nJARVIS MEMORY:\n{memory_ctx}"
+        dynamic_part += f"\n\nJARVIS MEMORY:\n{memory_ctx}"
 
     # Three-tier memory — inject rolling summary of earlier conversation
     if session_summary:
-        system += f"\n\nSESSION CONTEXT (earlier in this conversation):\n{session_summary}"
+        dynamic_part += f"\n\nSESSION CONTEXT (earlier in this conversation):\n{session_summary}"
+
+    # Self-eval — re-inject preferences Marion has learned the user wants.
+    _prefs = self_eval.get_preferences_text(lang)
+    if _prefs:
+        dynamic_part += _prefs
+
+    # Self-formation (Phase 3) — inject active guidance from her own perf review.
+    _guidance = self_formation.get_guidance_text(lang)
+    if _guidance:
+        dynamic_part += _guidance
 
     # Self-awareness — remind JARVIS of last response to avoid repetition
     if last_response:
-        system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
+        dynamic_part += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
+
+    # Language — the user spoke French/Turkish, so reply in kind (Whisper detected it).
+    _lang_names = {"fr": ("French", "mon amour"), "tr": ("Turkish", "canım")}
+    if lang in _lang_names:
+        name, honorific = _lang_names[lang]
+        dynamic_part += (
+            f"\n\nLANGUAGE (critical): You MUST reply ONLY in {name}. Never English, "
+            f"Spanish, Italian, Portuguese or any other language — reply in {name} even "
+            f"if the transcribed input looks garbled or like another language. Keep the "
+            f"butler wit but address the user INFORMALLY and affectionately as '{honorific}' "
+            f"(never 'sir' or another language's honorific). Use the informal register: in "
+            f"French always tutoyer (use 'tu', 'ton/ta', 'toi' — never 'vous'/'votre'); in "
+            f"Turkish use the informal 'sen' form (never 'siz'/formal '-iniz' endings). "
+            f"[ACTION:X] tags (if any) stay in English exactly as specified, but every "
+            f"spoken word must be {name}."
+        )
+        _persona = {"fr": "Marion", "tr": "Eda"}.get(lang)
+        if _persona:
+            dynamic_part += (
+                f" IN THIS LANGUAGE YOUR NAME IS '{_persona}', not JARVIS. Refer to "
+                f"yourself as {_persona}; if asked your name, say you are {_persona}."
+            )
 
     # Use conversation history — keep the last 20 messages for context
     # (older conversation is captured in session_summary)
@@ -1220,11 +2200,22 @@ async def generate_response(
     if not messages or messages[-1].get("content") != text:
         messages = messages + [{"role": "user", "content": text}]
 
+    # Cached static prefix + variable live context as separate system blocks.
+    system_blocks = []
+    if _static_prefix:
+        system_blocks.append({"type": "text", "text": _static_prefix,
+                              "cache_control": {"type": "ephemeral"}})
+    system_blocks.append({"type": "text", "text": dynamic_part})
+
     try:
         response = await client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=250,  # Extra room for [ACTION:X] tags
-            system=system,
+            # Cap kept tight on purpose: short replies = faster generation AND
+            # far less TTS + D-ID lip-sync time (the spoken part is the latency
+            # bottleneck). Auto-tuned by self_eval within [90, 160]; defaults 140
+            # (fits 1-2 sentences plus an [ACTION:X] tag).
+            max_tokens=self_eval.get_max_tokens(),
+            system=system_blocks,
             messages=messages,
         )
         track_usage(response)
@@ -1297,9 +2288,12 @@ def _cost_from_tokens(input_t: int, output_t: int) -> float:
 
 
 def track_usage(response):
-    """Track token usage from an Anthropic API response."""
-    inp = getattr(response.usage, "input_tokens", 0) if hasattr(response, "usage") else 0
-    out = getattr(response.usage, "output_tokens", 0) if hasattr(response, "usage") else 0
+    """Track token usage from an API response."""
+    if hasattr(response, "usage") and response.usage:
+        inp = getattr(response.usage, "input_tokens", None) or getattr(response.usage, "prompt_tokens", 0)
+        out = getattr(response.usage, "output_tokens", None) or getattr(response.usage, "completion_tokens", 0)
+    else:
+        inp = out = 0
     _session_tokens["input"] += inp
     _session_tokens["output"] += out
     _session_tokens["api_calls"] += 1
@@ -1335,6 +2329,7 @@ _ctx_cache = {
     "calendar": "No calendar data yet.",
     "mail": "No mail data yet.",
     "weather": "Weather data unavailable.",
+    "news": "No world news yet.",
 }
 
 
@@ -1346,7 +2341,18 @@ def _refresh_context_sync():
     import threading
 
     def _worker():
+        _loop_n = 0
         while True:
+            # World news — refreshed every ~5 min (RSS politeness), and once on
+            # the first pass so JARVIS has headlines early.
+            if _loop_n % 10 == 0:
+                try:
+                    block = _fetch_news_sync()
+                    if block:
+                        _ctx_cache["news"] = block
+                except Exception:
+                    pass
+            _loop_n += 1
             try:
                 # Screen — fast
                 try:
@@ -1408,6 +2414,24 @@ return windowList
     log.info("Context refresh thread started")
 
 
+async def _hourly_context_refresh():
+    """Keep the slower ambient context fresh so JARVIS always has up-to-date
+    information without the user having to ask.
+
+    The sync thread above already refreshes weather/screen (~30s) and news
+    (~5 min) — all well under an hour. Calendar and mail were only fetched
+    on demand, so this drives them too: once at startup, then every hour.
+    Both `_do_*_lookup` helpers update `_ctx_cache` as a side effect.
+    """
+    while True:
+        for name, fn in (("calendar", _do_calendar_lookup), ("mail", _do_mail_lookup)):
+            try:
+                await fn()
+            except Exception as e:
+                log.debug(f"hourly {name} refresh failed: {e}")
+        await asyncio.sleep(3600)  # every hour
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global anthropic_client, cached_projects
@@ -1419,7 +2443,38 @@ async def lifespan(application: FastAPI):
 
     # Start context refresh in a separate thread (never touches event loop)
     _refresh_context_sync()
+    # Hourly refresh of the on-demand sources (calendar + mail) so the cache is
+    # never more than an hour stale; weather/news/screen refresh faster above.
+    asyncio.create_task(_hourly_context_refresh())
+    self_eval.init()  # continuous self-improvement (Phase 1)
+    self_eval.set_speak_sink(
+        lambda text, lang="fr": asyncio.create_task(task_manager.push_speech(text, lang)))
+    perf_monitor.init()  # real-time per-turn telemetry + bug flags (Phase 0)
+    bug_fixer.init()  # autonomous bug→fix loop (Phase 2)
+    bug_fixer.set_speak_sink(
+        lambda text, lang="fr": asyncio.create_task(task_manager.push_speech(text, lang)))
+    # Only run the UNATTENDED timer when explicitly allowed (BUGFIX_ENABLED=true).
+    # Otherwise detection/fix runs only on demand via POST /api/bugfix/scan.
+    if bug_fixer.is_enabled():
+        asyncio.create_task(bug_fixer.loop())  # detect recurring bugs → draft fixes
+        log.warning("bug-fixer AUTONOMOUS timer is ON (writes code unattended)")
+    self_formation.init()  # periodic self-assessment → learned guidance (Phase 3)
+    asyncio.create_task(self_formation.loop(lambda: anthropic_client))
     log.info("JARVIS server starting")
+
+    # Monitor the DoorBird gate intercom: announce + describe visitors on a ring.
+    if doorbird.enabled():
+        asyncio.create_task(doorbird.monitor_rings(_on_doorbell))
+        log.info("DoorBird ring monitor task started")
+        # Also watch the gate MOTION sensor → recognise Oz's car (plate GX-137-QN).
+        asyncio.create_task(doorbird.monitor_motion(_on_gate_motion))
+        log.info("DoorBird motion monitor task started (car recognition)")
+
+    # Pre-warm the Plejd BLE connection + gateway so light commands are fast from
+    # the first one (the slow ~20s connect happens here, not on the first command).
+    if plejd_lights.enabled():
+        asyncio.create_task(plejd_lights.prewarm())
+        log.info("Plejd pre-warm task started")
 
     yield
 
@@ -1434,12 +2489,254 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# WatchGuard access log (Phase 1: log only, never blocks). Records every HTTP
+# request from a NON-localhost client — its source IP, method and the path it
+# hit — so we have a forensic trail of *what* an unauthorised device tried.
+_WG_ACCESS_LOG = Path(__file__).resolve().parent / ".run" / "access.log"
+
+
+@app.middleware("http")
+async def _watchguard_access_log(request: Request, call_next):
+    client = request.client.host if request.client else "?"
+    response = await call_next(request)
+    try:
+        if not (client.startswith("127.") or client in ("::1", "localhost")):
+            _WG_ACCESS_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(_WG_ACCESS_LOG, "a") as f:
+                f.write(f"{datetime.now().isoformat(timespec='seconds')} {client} "
+                        f"{request.method} {request.url.path} -> {response.status_code}\n")
+    except Exception:
+        pass
+    return response
+
 
 # -- REST Endpoints --------------------------------------------------------
 
 @app.get("/api/health")
 async def health():
     return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
+
+
+@app.api_route("/api/presence", methods=["GET", "POST"])
+async def api_presence(request: Request):
+    """Owner geofence webhook (called by an iPhone Shortcut on arriving/leaving
+    home). Token-protected. ?state=home|arriving marks the owner near (the gate's
+    2nd factor); ?state=away clears it. GET so a Shortcut can just open a URL."""
+    token = request.query_params.get("token", "")
+    if not PRESENCE_TOKEN or token != PRESENCE_TOKEN:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    state = (request.query_params.get("state") or "home").lower()
+    near = state in ("home", "arriving", "arrive", "near", "1", "true", "yes")
+    _owner_presence["near"] = near
+    _owner_presence["ts"] = time.time()
+    log.info(f"[presence] owner state={state} near={near}")
+    return {"ok": True, "near": near, "ttl_s": PRESENCE_TTL_S}
+
+
+@app.get("/api/selfeval/stats")
+async def api_selfeval_stats():
+    """Self-improvement telemetry for the in-app Self-Evolution HUD."""
+    try:
+        return self_eval.stats(24)
+    except Exception:
+        return {"window_h": 24, "total": 0, "by_kind": {}, "recent": [],
+                "vocab_total": 0, "prefs_total": 0, "max_tokens": 140}
+
+
+@app.post("/api/gate/test_ring")
+async def api_gate_test_ring(request: Request):
+    """Local-only: simulate a gate ring to preview the centre-screen camera
+    surge without physically ringing."""
+    client = request.client.host if request.client else ""
+    if not (client.startswith("127.") or client in ("::1", "localhost")):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        await task_manager._notify({"type": "gate_ring"})
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.get("/api/watchguard/stats")
+async def api_watchguard_stats():
+    """Live security telemetry for the in-app diagnostic HUD: alert counts by
+    severity, the most recent events, and whether the watchguard is running."""
+    import sqlite3
+    import subprocess as _sp
+    db = Path(__file__).resolve().parent / "data" / "watchguard.db"
+    out = {"active": False, "total": 0, "critical": 0, "warning": 0,
+           "info": 0, "recent": [], "ports": [], "files": 0}
+    try:
+        r = _sp.run(["pgrep", "-f", "watchguard.py"], capture_output=True, timeout=3)
+        out["active"] = r.returncode == 0
+    except Exception:
+        pass
+    if db.exists():
+        try:
+            c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            c.row_factory = sqlite3.Row
+            for row in c.execute("SELECT severity, COUNT(*) n FROM events GROUP BY severity"):
+                sev = (row["severity"] or "info").lower()
+                out[sev] = out.get(sev, 0) + row["n"]
+                out["total"] += row["n"]
+            out["recent"] = [
+                {"ts": r2["ts"], "severity": r2["severity"], "kind": r2["kind"],
+                 "source": r2["source"], "detail": r2["detail"]}
+                for r2 in c.execute(
+                    "SELECT ts, severity, kind, source, detail FROM events "
+                    "ORDER BY id DESC LIMIT 12")
+            ]
+            c.close()
+        except Exception:
+            pass
+    return out
+
+
+@app.post("/api/watchguard/announce")
+async def api_watchguard_announce(payload: dict, request: Request):
+    """Internal alert sink — lets watchguard.py make Marion speak an alert out
+    loud. LOCAL-ONLY: rejected for any non-loopback client so it can't itself be
+    abused from the network."""
+    client = request.client.host if request.client else ""
+    if not (client.startswith("127.") or client in ("::1", "localhost")):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    text = (payload.get("text") or "").strip()
+    if text:
+        try:
+            await task_manager.push_speech(text, lang=payload.get("lang", "fr"))
+        except Exception as e:
+            log.warning(f"watchguard announce failed: {e}")
+    return {"ok": True}
+
+
+@app.get("/api/network/inventory")
+async def api_network_inventory():
+    """Latest LAN inventory for the network-map dashboard (frontend/public/
+    network.html). Produced by tools/lan_scan.py; returns 404 until first scan."""
+    inv = Path(__file__).resolve().parent / "data" / "lan_inventory.json"
+    if inv.exists():
+        try:
+            return JSONResponse(json.loads(inv.read_text()))
+        except Exception:
+            pass
+    return JSONResponse({"error": "no inventory yet — run tools/lan_scan.py"},
+                        status_code=404)
+
+
+@app.post("/api/network/scan")
+async def api_network_scan():
+    """Trigger a fresh LAN scan (the vendor cache makes re-scans quick) and return
+    the updated inventory. The blocking scan runs in a thread executor."""
+    import subprocess as _sp
+    root = Path(__file__).resolve().parent
+    tool = root / "tools" / "lan_scan.py"
+
+    def _run():
+        _sp.run([sys.executable, str(tool)], cwd=str(root),
+                capture_output=True, timeout=180)
+        return json.loads((root / "data" / "lan_inventory.json").read_text())
+
+    try:
+        return JSONResponse(await asyncio.get_event_loop().run_in_executor(None, _run))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/perf/stats")
+async def api_perf_stats():
+    """Real-time voice-loop telemetry for the on-screen HUD (Phase 0): per-stage
+    latency percentiles, warn/bad counts, and the most recent flagged turns."""
+    try:
+        return JSONResponse(perf_monitor.stats(24))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/perf/flags")
+async def api_perf_flags():
+    """Only the flagged turns (slow / off-target / errored) — what Phase 2's
+    autonomous fix loop will consume."""
+    try:
+        return JSONResponse({"flags": perf_monitor.recent_flags(24)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/bugfix/list")
+async def api_bugfix_list():
+    """Autonomous fix records (Phase 2) — for the review panel."""
+    try:
+        return JSONResponse({"fixes": bug_fixer.list_fixes(25)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/bugfix/scan")
+async def api_bugfix_scan():
+    """Force a detection pass now (otherwise runs on a timer)."""
+    try:
+        return JSONResponse(await bug_fixer.detect_and_fix(force=True))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/bugfix/{fix_id}/diff")
+async def api_bugfix_diff(fix_id: int):
+    """Full patch of a proposed fix, for human review before approval."""
+    try:
+        return JSONResponse({"diff": await bug_fixer.diff(fix_id)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/bugfix/{fix_id}/approve")
+async def api_bugfix_approve(fix_id: int):
+    """Land a READY fix (merge its branch). The one human-gated write path."""
+    try:
+        return JSONResponse(await bug_fixer.approve(fix_id))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/bugfix/{fix_id}/dismiss")
+async def api_bugfix_dismiss(fix_id: int):
+    """Discard a proposed fix (remove worktree + branch)."""
+    try:
+        return JSONResponse(await bug_fixer.dismiss(fix_id))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/formation/report")
+async def api_formation_report():
+    """Latest self-assessment + guidance rules (Phase 3) for the review panel."""
+    try:
+        return JSONResponse({"latest": self_formation.latest(),
+                             "history": self_formation.history(10)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/formation/run")
+async def api_formation_run():
+    """Force a self-assessment now (otherwise runs on a slow timer)."""
+    try:
+        return JSONResponse(await self_formation.run_assessment(anthropic_client, force=True))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/formation/guidance/{gid}/{action}")
+async def api_formation_guidance(gid: int, action: str):
+    """Activate (apply) / propose / remove a guidance rule. Human gate for the
+    behaviour changes Marion proposes about herself."""
+    status = {"activate": "active", "propose": "proposed", "remove": "removed"}.get(action)
+    if not status:
+        return JSONResponse({"error": "action must be activate|propose|remove"}, status_code=400)
+    try:
+        return JSONResponse(self_formation.set_guidance_status(gid, status))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/api/tts-test")
@@ -1508,6 +2805,105 @@ async def api_list_projects():
     return {"projects": cached_projects}
 
 
+# -- D-ID streaming (WebRTC) proxy -----------------------------------------
+# The browser drives the RTCPeerConnection but must NOT hold the D-ID key, so
+# every D-ID streaming call is relayed through here. See did_avatar.py.
+
+@app.post("/api/did/stream/new")
+async def api_did_stream_new(look: str = "default"):
+    if not did_avatar.is_enabled():
+        return JSONResponse({"error": "D-ID not configured"}, status_code=400)
+    data = await did_avatar.create_stream(look)
+    if not data:
+        return JSONResponse({"error": "stream create failed"}, status_code=502)
+    return data
+
+
+@app.post("/api/did/stream/sdp")
+async def api_did_stream_sdp(payload: dict):
+    ok = await did_avatar.stream_sdp(payload.get("stream_id"), payload.get("session_id"), payload.get("answer"))
+    return {"ok": ok}
+
+
+@app.post("/api/did/stream/ice")
+async def api_did_stream_ice(payload: dict):
+    cand = {k: payload[k] for k in ("candidate", "sdpMid", "sdpMLineIndex") if k in payload}
+    ok = await did_avatar.stream_ice(payload.get("stream_id"), payload.get("session_id"), cand)
+    return {"ok": ok}
+
+
+@app.post("/api/did/stream/close")
+async def api_did_stream_close(payload: dict):
+    await did_avatar.close_stream(payload.get("stream_id"), payload.get("session_id"))
+    return {"ok": True}
+
+
+# -- DoorBird live gate camera (MJPEG proxy — keeps the creds server-side) --
+@app.get("/api/doorbird/video")
+async def api_doorbird_video():
+    if not doorbird.enabled():
+        return JSONResponse({"error": "DoorBird not configured"}, status_code=404)
+    return StreamingResponse(doorbird.video_stream(), media_type=doorbird.VIDEO_CONTENT_TYPE)
+
+
+@app.get("/api/weather")
+async def api_weather():
+    """Current weather condition for the UI's weather effects (rain/sun).
+
+    Lazily re-fetches the sky in the background when the cached code is older
+    than the TTL, so Marion's outfit follows real weather changes within
+    minutes (the frontend polls this) instead of waiting for the hourly refresh.
+    """
+    global _weather_refreshing
+    if (not _weather_refreshing
+            and (time.time() - _weather_code_at) > _WEATHER_CODE_TTL_SECONDS):
+        _weather_refreshing = True
+
+        async def _bg_refresh():
+            global _weather_refreshing
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, _fetch_weather_string_sync)
+            finally:
+                _weather_refreshing = False
+        asyncio.create_task(_bg_refresh())
+    return {"condition": _weather_condition(), "code": _cached_weather_code,
+            "text": _ctx_cache.get("weather", "")}
+
+
+@app.post("/api/health/ingest")
+async def api_health_ingest(request: Request):
+    """Ingest heart-rate readings pushed from an iOS exporter; speak on breach.
+
+    The iOS app (e.g. Health Auto Export) POSTs here on a schedule. We store the
+    readings, and if one crosses a threshold (and we're past the cooldown), Marion
+    says it out loud through any connected browser. NOT a medical device — see
+    health_access.py. Auth via ?token= (or X-Health-Token header) when a
+    HEALTH_WEBHOOK_TOKEN is configured.
+    """
+    provided = request.query_params.get("token") or request.headers.get("X-Health-Token")
+    if not health_access.token_ok(provided):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+
+    result = health_access.ingest(payload)
+    alert = result.pop("_alert_obj", None)
+    if alert is not None:
+        # Spoken alert only matters if a browser is listening; the breach is
+        # recorded regardless. Use the configured alert language.
+        spoken = await task_manager.push_speech(alert.text(), lang=health_access.ALERT_LANG)
+        result["spoken"] = spoken
+    return {"ok": True, **result}
+
+
+@app.get("/api/health/status")
+async def api_health_status():
+    """Config + most recent heart-rate reading (diagnostics / 'how's my heart')."""
+    return health_access.latest_status()
+
+
 # -- Fast Action Detection (no LLM call) -----------------------------------
 
 def _scan_projects_sync() -> list[dict]:
@@ -1535,6 +2931,14 @@ def detect_action_fast(text: str) -> dict | None:
     # Only trigger on SHORT, clear commands (< 12 words)
     if len(words) > 12:
         return None  # Long messages are conversation, not commands
+
+    # Camera requests — checked BEFORE screen so "look at me" goes to the webcam,
+    # not the desktop. Requires an explicit camera/face cue to avoid overlap.
+    if any(p in t for p in ["look at me", "can you see me", "do you see me",
+                             "through the camera", "use the camera", "turn on the camera",
+                             "look through the camera", "what do i look like", "how do i look",
+                             "webcam", "on the camera", "with the camera", "via the camera"]):
+        return {"action": "describe_camera"}
 
     # Screen requests — checked BEFORE project matching to prevent misrouting
     if any(p in t for p in ["look at my screen", "what's on my screen", "whats on my screen",
@@ -1588,6 +2992,21 @@ def detect_action_fast(text: str) -> dict | None:
                              "what's the cost", "whats the cost", "api cost", "token usage",
                              "how expensive", "what's my bill"]):
         return {"action": "check_usage"}
+
+    # Morning briefing — full daily rundown
+    if any(p in t for p in ["morning briefing", "brief me", "my briefing", "daily briefing",
+                             "give me my briefing", "good morning jarvis", "start my day"]):
+        return {"action": "briefing"}
+
+    # Crypto market sentiment — RSS news mood score
+    if any(p in t for p in ["market sentiment", "crypto sentiment", "crypto mood",
+                             "how's the crypto market", "hows the crypto market",
+                             "how's the market feeling", "sentiment score",
+                             "is crypto bullish", "is crypto bearish", "bullish or bearish"]):
+        return {"action": "market_sentiment"}
+
+    # News/geopolitics/AI/tech/Geneva/Istanbul are answered INLINE by the LLM from
+    # the WORLD NEWS context (one fast step) — no slow two-step lookup dispatch.
 
     return None  # Everything else goes to the LLM for conversational routing
 
@@ -1666,12 +3085,170 @@ async def handle_show_recent() -> str:
 _active_lookups: dict[str, dict] = {}  # id -> {"type": str, "status": str, "started": float}
 
 
+# ---------------------------------------------------------------------------
+# World news (geopolitics) — reputable RSS, summarised on demand
+# ---------------------------------------------------------------------------
+
+# Topic-grouped headline sources. Google News RSS search gives reliable,
+# topic-targeted, recent headlines (no key); reputable wires cover the world.
+# Titles only — JARVIS synthesises answers, never reproducing article text.
+NEWS_TOPICS: dict[str, list[str]] = {
+    "WORLD / GEOPOLITICS": [
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+    ],
+    "ARTIFICIAL INTELLIGENCE": [
+        "https://news.google.com/rss/search?q=artificial+intelligence+when:2d&hl=en-US&gl=US&ceid=US:en",
+    ],
+    "TECHNOLOGY": [
+        "https://news.google.com/rss/search?q=technology+when:2d&hl=en-US&gl=US&ceid=US:en",
+    ],
+    "GENEVA": [
+        "https://news.google.com/rss/search?q=Gen%C3%A8ve+when:3d&hl=fr&gl=CH&ceid=CH:fr",
+    ],
+    "ISTANBUL": [
+        "https://news.google.com/rss/search?q=Istanbul+when:3d&hl=en-US&gl=TR&ceid=TR:en",
+    ],
+}
+
+
+def _fetch_feed_titles(url: str, n: int, seen: set) -> list[str]:
+    """Return up to n unseen headline titles from one RSS/Atom feed (titles only)."""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    def _local(t: str) -> str:
+        return t.rsplit("}", 1)[-1].lower()
+
+    out: list[str] = []
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (JARVIS)"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            root = ET.fromstring(r.read())
+    except Exception:
+        return out
+    for el in root.iter():
+        if _local(el.tag) not in ("item", "entry"):
+            continue
+        title = ""
+        for ch in el:
+            if _local(ch.tag) == "title" and ch.text and not title:
+                title = ch.text.strip()
+        if not title:
+            continue
+        key = title.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(title)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _fetch_news_sync(per_topic: int = 5) -> str:
+    """Build a topic-grouped block of recent headlines (titles only).
+
+    Covers world/geopolitics, AI, technology, and the user's two cities
+    (Geneva, Istanbul). Best-effort; a failing feed is skipped.
+    """
+    seen: set[str] = set()
+    blocks: list[str] = []
+    for topic, urls in NEWS_TOPICS.items():
+        titles: list[str] = []
+        for u in urls:
+            titles += _fetch_feed_titles(u, per_topic, seen)
+            if len(titles) >= per_topic:
+                break
+        if titles:
+            blocks.append(topic + ":\n" + "\n".join(f"- {t}" for t in titles[:per_topic]))
+    return "\n\n".join(blocks)
+
+
+async def _do_news_lookup(query: str, lang: str = "en") -> str:
+    """Answer a news question from the CACHED topic headlines (fast — no fresh
+    fetch unless the cache is empty). Used only for explicit deeper dives; most
+    news questions are answered inline from the prompt's WORLD NEWS context."""
+    headlines = _ctx_cache.get("news", "")
+    if not headlines or headlines == "No world news yet.":
+        try:
+            headlines = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, _fetch_news_sync, 5), timeout=10)
+        except Exception:
+            headlines = ""
+        if headlines:
+            _ctx_cache["news"] = headlines
+    if not headlines:
+        return {
+            "fr": "Je n'arrive pas à joindre les dépêches pour l'instant, mon amour.",
+            "tr": "Şu anda haber kaynaklarına ulaşamıyorum canım.",
+        }.get(lang, "I can't reach the news wires just now, sir.")
+    if not anthropic_client:
+        for ln in headlines.splitlines():
+            if ln.startswith("- "):
+                return ln[2:]
+        return "I have the headlines, sir."
+    lang_name = {"fr": "French", "tr": "Turkish"}.get(lang, "English")
+    try:
+        resp = await anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=220,
+            system=(
+                "You are JARVIS, a British-butler AI with dry economy of language. "
+                "Using ONLY the recent headlines provided (grouped by topic: world, "
+                "AI, technology, Geneva, Istanbul), answer the user's question for "
+                f"SPOKEN delivery in {lang_name}. One or two sentences, calm and "
+                "precise; lead with the most relevant development. Synthesise in your "
+                "own words — do NOT list every headline or quote articles. If they "
+                "don't cover it, say so briefly. No markdown."
+            ),
+            messages=[{"role": "user",
+                       "content": f"Headlines:\n{headlines}\n\nQuestion: {query}"}],
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        log.warning(f"news summary failed: {e}")
+        return "I'm afraid the news desk is unresponsive, sir."
+
+
+async def _do_weather_lookup(place: str, lang: str = "en") -> str:
+    """Speak precise current weather for ANY place on Earth, geocoded on demand.
+
+    `place` is whatever the user named ("Tokyo", "the south of France", "Geneva").
+    Runs the blocking geocode + forecast fetch in a thread so the event loop is
+    never stalled, then composes one spoken line in the active language.
+    """
+    place = (place or "").strip()
+    if not place:
+        return {
+            "fr": "Quelle ville, mon amour ?",
+            "tr": "Hangi şehir canım?",
+        }.get(lang, "Which place, sir?")
+    try:
+        w = await asyncio.get_event_loop().run_in_executor(
+            None, _fetch_place_weather_sync, place, lang)
+    except Exception as e:
+        log.warning(f"weather lookup failed: {e}")
+        w = None
+    if not w:
+        return {
+            "fr": "Je n'arrive pas à joindre le service météo, mon amour.",
+            "tr": "Hava durumu servisine ulaşamıyorum canım.",
+        }.get(lang, "I can't reach the weather service just now, sir.")
+    return _compose_weather_line(w, lang)
+
+
 async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict] = None, voice_state: dict = None):
     """Run a slow lookup, then speak the result back.
 
     JARVIS stays conversational — this runs completely off the main path.
     """
     lookup_id = str(uuid.uuid4())[:8]
+    # Baseline: the user utterance that triggered this lookup. We only suppress
+    # the spoken result if a NEWER utterance arrives while we work — otherwise a
+    # fast lookup (e.g. sentiment, ~1.5s) gets wrongly muted as "talking over"
+    # the very question that asked for it.
+    trigger_time = voice_state["last_user_time"] if voice_state else 0.0
     _active_lookups[lookup_id] = {
         "type": lookup_type,
         "status": "working",
@@ -1688,20 +3265,26 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
 
         _active_lookups[lookup_id]["status"] = "done"
 
-        # Speak the result — skip audio if user spoke recently to avoid collision
-        if voice_state and time.time() - voice_state["last_user_time"] < 3:
-            log.info(f"Skipping lookup audio for {lookup_type} — user spoke recently")
+        # Speak the result — but stay quiet if the user has said something NEW
+        # since this lookup began (don't talk over a fresh request).
+        if voice_state and voice_state["last_user_time"] > trigger_time:
+            log.info(f"Skipping lookup audio for {lookup_type} — newer user input arrived")
             # Result is still stored in history below
         else:
             tts = strip_markdown_for_tts(result_text)
-            audio = await synthesize_speech(tts)
+            audio = await synthesize_speech(tts, lang=voice_state.get("lang", "en") if voice_state else "en")
             try:
                 await ws.send_json({"type": "status", "state": "speaking"})
                 if audio:
-                    await ws.send_json({"type": "audio", "data": audio, "text": result_text})
+                    # synthesize_speech returns raw mp3 bytes — base64-encode for JSON.
+                    # Do NOT send "idle" here: the frontend returns to idle when the
+                    # audio actually finishes (audioPlayer.onFinished). Sending idle
+                    # now would resume the mic mid-playback and the mic would cut its
+                    # own voice off after ~2s.
+                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": result_text})
                 else:
                     await ws.send_json({"type": "text", "text": result_text})
-                await ws.send_json({"type": "status", "state": "idle"})
+                    await ws.send_json({"type": "status", "state": "idle"})
             except Exception:
                 pass
 
@@ -1715,10 +3298,10 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
         _active_lookups[lookup_id]["status"] = "timeout"
         try:
             fallback = f"That {lookup_type} check is taking too long, sir. The data may still be syncing."
-            audio = await synthesize_speech(fallback)
+            audio = await synthesize_speech(fallback, lang=voice_state.get("lang", "en") if voice_state else "en")
             await ws.send_json({"type": "status", "state": "speaking"})
             if audio:
-                await ws.send_json({"type": "audio", "data": audio, "text": fallback})
+                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": fallback})
             await ws.send_json({"type": "status", "state": "idle"})
         except Exception:
             pass
@@ -1744,26 +3327,29 @@ async def _do_mail_lookup() -> str:
     """Slow mail fetch — runs in thread."""
     unread_info = await get_unread_count()
     if isinstance(unread_info, dict):
+        if unread_info.get("error") or unread_info.get("total") is None:
+            return "I couldn't reach Mail just now, sir — it may still be syncing."
         _ctx_cache["mail"] = format_unread_summary(unread_info)
         if unread_info["total"] == 0:
             return "Inbox is clear, sir. No unread messages."
-        unread_msgs = await get_unread_messages(count=5)
         summary = format_unread_summary(unread_info)
-        if unread_msgs:
-            top = unread_msgs[:3]
+        # Fast recent headers (no slow read-status filter / body fetch).
+        recent = await get_recent_headers(count=5)
+        if recent:
             details = ". ".join(
                 f"{_short_sender(m['sender'])} regarding {m['subject']}"
-                for m in top
+                + ("" if m["read"] else " (unread)")
+                for m in recent[:4]
             )
             return f"{summary} Most recent: {details}."
         return summary
     return "Couldn't reach Mail at the moment, sir."
 
 
-async def _do_screen_lookup() -> str:
+async def _do_screen_lookup(lang: str = "en") -> str:
     """Screen describe — runs in thread."""
     if anthropic_client:
-        return await describe_screen(anthropic_client)
+        return await describe_screen(anthropic_client, lang=lang)
     windows = await get_active_windows()
     if windows:
         apps = set(w["app"] for w in windows)
@@ -1773,6 +3359,381 @@ async def _do_screen_lookup() -> str:
             result += f" Currently focused on {active['app']}: {active['title']}."
         return result
     return "Couldn't see the screen, sir."
+
+
+async def request_camera_frame(ws, pending_frames: dict, timeout: float = 12.0) -> str | None:
+    """Ask the browser for ONE webcam frame and await it.
+
+    The webcam lives in the frontend, so we send a {"type": "capture_camera"}
+    request and wait for the matching {"type": "camera_frame"} reply, which the
+    voice loop resolves via `pending_frames`. Returns base64 JPEG or None.
+    """
+    request_id = str(uuid.uuid4())[:8]
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    pending_frames[request_id] = fut
+    try:
+        await ws.send_json({"type": "capture_camera", "request_id": request_id})
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except (asyncio.TimeoutError, Exception):
+        return None
+    finally:
+        pending_frames.pop(request_id, None)
+
+
+async def _do_camera_lookup(ws, pending_frames: dict, lang: str = "en") -> str:
+    """Webcam describe — request a single frame from the browser, then vision."""
+    frame_b64 = await request_camera_frame(ws, pending_frames)
+    if not frame_b64:
+        return ("I couldn't get a camera frame, sir. The webcam may be blocked, "
+                "in use by another app, or permission hasn't been granted.")
+    return await describe_camera(anthropic_client, frame_b64, lang=lang)
+
+
+async def _camera_comment(ws, pending_frames, lang: str = "en") -> tuple[str, Optional[bytes]]:
+    """Startup look-at-the-user: a short spoken comment on their state/outfit
+    (with the persona's wit). Stays SILENT if the webcam isn't available — we
+    don't want a failure line at every startup. Returns (text, mp3_bytes)."""
+    if pending_frames is None:
+        return "", None
+    try:
+        frame_b64 = await request_camera_frame(ws, pending_frames)
+        if not frame_b64:
+            return "", None  # camera blocked/unavailable — skip quietly
+        text = await asyncio.wait_for(describe_camera(anthropic_client, frame_b64, lang=lang), timeout=20)
+    except Exception as e:
+        log.warning(f"startup camera comment failed: {e}")
+        return "", None
+    if not text:
+        return "", None
+    audio = await synthesize_speech(strip_markdown_for_tts(text), lang=lang)
+    return text, audio
+
+
+# Market sentiment — runs the kukapay market-sentiment skill's analyzer as a
+# subprocess. It needs `requests`, so it's invoked with an interpreter that has
+# it (the bybit-mcp venv by default). Both paths are env-overridable.
+SENTIMENT_PYTHON = os.getenv("SENTIMENT_PYTHON", "/Users/oguz/bybit-mcp/venv/bin/python")
+SENTIMENT_SCRIPT = os.getenv(
+    "SENTIMENT_SCRIPT",
+    "/Users/oguz/bybit-mcp/.agents/skills/market-sentiment/scripts/sentiment_analyzer.py",
+)
+
+
+async def _do_sentiment_lookup() -> str:
+    """Run the market-sentiment analyzer and condense it into one spoken line."""
+    if not Path(SENTIMENT_SCRIPT).exists():
+        return "The market sentiment tool isn't installed, sir."
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            SENTIMENT_PYTHON, SENTIMENT_SCRIPT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+    except asyncio.TimeoutError:
+        return "The sentiment feeds are slow to respond, sir. Try again in a moment."
+    except Exception as e:
+        log.warning(f"Sentiment lookup failed: {e}")
+        return "I couldn't reach the market sentiment tool, sir."
+
+    # Parse score / article count / verdict from the script's printed report.
+    score = None
+    articles = None
+    overall = ""
+    for line in stdout.decode(errors="replace").splitlines():
+        s = line.strip()
+        if s.startswith("Market Sentiment Score:"):
+            try:
+                score = float(s.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif s.startswith("- Analyzed"):
+            m = _action_re.search(r"Analyzed\s+(\d+)\s+recent articles", s)
+            if m:
+                articles = m.group(1)
+        elif s.startswith("Overall:"):
+            overall = s.split(":", 1)[1].strip()
+
+    if score is None:
+        return "The sentiment tool returned nothing readable, sir."
+
+    mood = "bullish" if score > 0.1 else "bearish" if score < -0.1 else "neutral"
+    detail = f"a score of {score:.2f}"
+    if articles:
+        detail += f" across {articles} recent articles"
+    summary = f"Crypto market sentiment is {mood}, sir — {detail}."
+    if overall:
+        summary += f" {overall}"
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Morning briefing — runs after the startup sequence
+# ---------------------------------------------------------------------------
+
+async def _prepare_briefing(lang: str) -> tuple[str, Optional[bytes]]:
+    """Gather all sources, compose the briefing text, and synthesize the audio.
+
+    Returns (text, mp3_bytes). This is the slow part (~20s) and is safe to run
+    during the boot screen so the result is ready the instant the boot ends.
+    """
+    # Gather everything concurrently, each bounded so one slow source (e.g. a
+    # laggy feed) can't stall the whole briefing.
+    async def _timed(coro, t):
+        try:
+            return await asyncio.wait_for(coro, timeout=t)
+        except Exception:
+            return None
+
+    traffic, weather, portfolio, gmail, cal_txt, senti = await asyncio.gather(
+        _timed(briefing.get_traffic(), 12),
+        _timed(briefing.get_weather(), 12),
+        _timed(briefing.get_portfolio(), 25),
+        _timed(gmail_access.get_briefing_mail(), 15),
+        _timed(_do_calendar_lookup(), 12),
+        _timed(briefing.get_sentiment(), 12),
+    )
+
+    def _safe(v, default="unavailable"):
+        return default if (v is None or isinstance(v, Exception)) else v
+
+    traffic = _safe(traffic, {}); weather = _safe(weather, {}); portfolio = _safe(portfolio, {})
+    gmail = _safe(gmail, {}); cal_txt = _safe(cal_txt); senti = _safe(senti, {})
+
+    # Build a plain-facts block for the LLM to turn into a spoken briefing.
+    facts = []
+    if isinstance(traffic, dict) and traffic.get("ok"):
+        facts.append(f"COMMUTE: {traffic['condition']}, about {traffic['eta_min']} minutes to the office "
+                     f"({traffic['distance']} via {traffic['route']}). Usual time {traffic['normal_min']} min.")
+    else:
+        facts.append("COMMUTE: traffic data unavailable.")
+    if isinstance(weather, dict) and weather.get("ok"):
+        facts.append(f"WEATHER (today, home area): {weather['conditions']}, currently {weather['current_c']}°C, "
+                     f"high {weather['high_c']}°C, low {weather['low_c']}°C, {weather['rain_chance']}% chance of rain. "
+                     f"Give a brief clothing suggestion based on this.")
+    else:
+        facts.append("WEATHER: unavailable.")
+    if isinstance(gmail, dict) and gmail.get("ok"):
+        lines = [f"EMAIL (Gmail): {gmail['unread_total']} total unread; "
+                 f"{gmail['primary_unread']} unread in the Primary category (real correspondence)."]
+        for m in gmail.get("important", []):
+            lines.append(f"  - from {m['from']}: {m['subject']}")
+        lines.append("Judge which, if any, genuinely look like they need a reply; "
+                     "ignore receipts, notifications and automated mail. If none need action, say so briefly.")
+        facts.append("\n".join(lines))
+    else:
+        facts.append("EMAIL: Gmail unavailable.")
+    facts.append(f"AGENDA: {cal_txt}")
+    if isinstance(portfolio, dict) and portfolio.get("ok"):
+        best = portfolio.get("best"); worst = portfolio.get("worst")
+        line = f"PORTFOLIO: total value ${portfolio['total_value']}, {portfolio['total_gain_pct']:+.1f}% today."
+        if best: line += f" Best {best['ticker']} {best['gain_pct']:+.1f}%."
+        if worst: line += f" Worst {worst['ticker']} {worst['gain_pct']:+.1f}%."
+        facts.append(line)
+    else:
+        facts.append("PORTFOLIO: unavailable.")
+    if isinstance(senti, dict) and senti.get("ok"):
+        facts.append(f"CRYPTO MOOD: {senti['mood']} (score {senti['score']:+.2f} "
+                     f"across {senti['articles']} crypto news articles).")
+    else:
+        facts.append("CRYPTO MOOD: unavailable.")
+
+    _names = {"fr": ("French", "mon amour"), "tr": ("Turkish", "canım")}
+    name, honorific = _names.get(lang, ("English", "sir"))
+
+    # Time-aware greeting — described SEMANTICALLY with no literal English words,
+    # otherwise the model copies them and writes the whole briefing in English.
+    hour = datetime.now().hour
+    if 5 <= hour < 12:
+        greet_rule = "It is the morning: greet him for the morning and say you hope he slept well."
+    elif 12 <= hour < 18:
+        greet_rule = "It is the middle of the day, NOT morning: greet him simply — a hello and welcome back."
+    else:
+        greet_rule = "It is the evening, NOT morning: greet him for the evening and say you hope he had a great day."
+
+    only = "" if lang not in _names else f" Use absolutely no English — every word must be in {name}."
+    _persona = {"fr": "Marion", "tr": "Eda"}.get(lang)
+    if _persona:
+        only += f" In this language your name is '{_persona}', not JARVIS — never say the word JARVIS."
+    system = (
+        f"You are JARVIS delivering {USER_NAME}'s briefing as a refined British butler. "
+        f"IMPORTANT: write the ENTIRE briefing — every word, including the greeting — in {name}, "
+        f"addressing the user INFORMALLY and affectionately as '{honorific}'. Use the informal "
+        f"register: French → tutoiement ('tu', never 'vous'); Turkish → informal 'sen' (never 'siz').{only} "
+        f"{greet_rule} Compose ONE flowing, spoken briefing covering, in order: the time-appropriate "
+        "greeting, the commute (traffic and ETA to the office), the weather with a short clothing "
+        "suggestion, any important emails, today's agenda, the portfolio with the key numbers, and the "
+        "crypto market mood. Natural and warm, no markdown, no lists, dry wit welcome but concise "
+        "— aim for 7 to 10 sentences. Do not invent facts; if something says unavailable, mention it briefly or skip."
+    )
+
+    response_text = None
+    if anthropic_client:
+        try:
+            resp = await anthropic_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=600,
+                system=system,
+                messages=[{"role": "user", "content": "FACTS:\n" + "\n".join(facts)}],
+            )
+            response_text = resp.content[0].text.strip()
+        except Exception as e:
+            log.warning(f"briefing compose failed: {e}")
+    if not response_text:
+        response_text = "Good morning, sir. I'm afraid I couldn't assemble the full briefing just now."
+
+    # A long briefing is ~24s of TTS in one call. Split into chunks and
+    # synthesize them CONCURRENTLY (~8s), returned as ordered audio segments the
+    # player queues — fits inside the boot prefetch window so it plays instantly.
+    sentences = _action_re.split(r"(?<=[.!?])\s+", response_text.strip())
+    n = 3
+    size = max(1, -(-len(sentences) // n))
+    chunks = [" ".join(sentences[i:i + size]) for i in range(0, len(sentences), size)] or [response_text]
+    # Low temperature so the independently-synthesized chunks stay consistent —
+    # at temp 0.9 each parallel chunk is a different "take" and the voice seems to
+    # change mid-briefing. (Same voice/model as live, just steadier.)
+    _briefing_tts = {"prosody": {"speed": 0.95}, "temperature": 0.25, "top_p": 0.5, "chunk_length": 300}
+    audios = await asyncio.gather(*[
+        synthesize_speech(strip_markdown_for_tts(c), lang=lang, params=_briefing_tts) for c in chunks
+    ])
+    audios = [a for a in audios if a]
+    return response_text, audios
+
+
+# Remember the date of the last delivered briefing so the automatic startup
+# briefing isn't repeated multiple times in the same day.
+_BRIEFING_STATE = Path(__file__).parent / "data" / "last_briefing.json"
+
+
+def _briefing_done_today() -> bool:
+    try:
+        d = json.loads(_BRIEFING_STATE.read_text()).get("date")
+        return d == datetime.now().strftime("%Y-%m-%d")
+    except Exception:
+        return False
+
+
+def _mark_briefing_done() -> None:
+    try:
+        _BRIEFING_STATE.parent.mkdir(parents=True, exist_ok=True)
+        _BRIEFING_STATE.write_text(json.dumps({"date": datetime.now().strftime("%Y-%m-%d")}))
+    except Exception as e:
+        log.warning(f"could not record briefing date: {e}")
+
+
+def _short_greeting(lang: str) -> str:
+    """A brief spoken greeting used in place of a repeated startup briefing."""
+    h = datetime.now().hour
+    if lang == "fr":
+        return ("Bonjour, mon amour." if h < 18 else "Bonsoir, mon amour.")
+    if lang == "tr":
+        return ("Günaydın canım." if h < 12 else
+                "İyi günler canım." if h < 18 else "İyi akşamlar canım.")
+    return ("Good morning, sir." if h < 12 else
+            "Welcome back, sir." if h < 18 else "Good evening, sir.")
+
+
+async def _speak_briefing(ws, voice_state, lang, audio: bytes, text: str):
+    """Speak `audio` as Marion. If a live D-ID WebRTC stream is open (FR/TR),
+    push it through the stream so she lip-syncs the startup speech in real time;
+    otherwise fall back to base64 audio (static face). Mirrors the main reply path
+    so the boot briefing animates her mouth just like a normal reply."""
+    stream = (voice_state or {}).get("did_stream") if lang in ("fr", "tr") else None
+    if stream and did_avatar.is_enabled():
+        _dur = await did_avatar.stream_speak(stream["id"], stream["session_id"], audio)
+        if _dur:
+            await ws.send_json({"type": "avatar_stream_speak", "text": text, "duration": _dur})
+            return
+    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": text})
+
+
+async def morning_briefing(ws, history: list[dict] = None, voice_state: dict = None, auto: bool = False, pending_frames: dict = None):
+    """Deliver the briefing — using the result prefetched during the boot screen
+    if available, otherwise preparing it now.
+
+    `auto=True` marks the automatic startup briefing: if one was already delivered
+    today, it is skipped (just a short greeting, so the mic still starts) — the
+    user can still trigger a full one by asking. Explicit requests always run.
+    """
+    lang = "en"
+    task = None
+    if voice_state:
+        lang = voice_state.get("forced_lang") or voice_state.get("lang") or "en"
+        task = voice_state.pop("briefing_task", None)
+
+    if auto and _briefing_done_today():
+        log.info("Skipping auto briefing — already delivered today")
+        if task is not None:
+            task.cancel()  # discard the prefetched composition
+        greeting = _short_greeting(lang)
+        g_audio = await synthesize_speech(strip_markdown_for_tts(greeting), lang=lang)
+        # No briefing today → still look at the user and comment (state + outfit).
+        # Greeting is short, so capture the comment FIRST and send both as one
+        # combined buffer (no gap, mic only resumes after the comment).
+        cam_text, cam_audio = await _camera_comment(ws, pending_frames, lang)
+        buf = b"".join([a for a in (g_audio, cam_audio) if a])
+        text = greeting + (f" {cam_text}" if cam_text else "")
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            if buf:
+                await _speak_briefing(ws, voice_state, lang, buf, text)
+            else:
+                await ws.send_json({"type": "text", "text": text})
+                await ws.send_json({"type": "status", "state": "idle"})
+        except Exception:
+            pass
+        if history is not None and cam_text:
+            history.append({"role": "assistant", "content": f"[greeting + look]: {text}"})
+        return
+
+    # Mark done UP-FRONT so rapid concurrent reloads don't each fire a briefing
+    # (the auto-skip check above will then short-circuit them).
+    _mark_briefing_done()
+    log.info(f"morning_briefing ({lang}); prefetched={task is not None}")
+    await ws.send_json({"type": "status", "state": "thinking"})
+    try:
+        if task is not None:
+            response_text, audios = await task   # prepared during the boot screen
+        else:
+            response_text, audios = await _prepare_briefing(lang)
+    except Exception as e:
+        log.warning(f"briefing failed: {e}")
+        response_text, audios = ("Good morning, sir. I couldn't assemble the briefing just now.", [])
+
+    # (Portfolio dashboard window opening removed at user request — the briefing
+    # still mentions the portfolio numbers, it just no longer opens a window.)
+
+    try:
+        await ws.send_json({"type": "status", "state": "speaking"})
+        if audios:
+            # Concatenate the parallel-synthesized mp3 chunks into ONE blob, then
+            # speak it (lip-synced via the live stream when one is open).
+            combined = b"".join(audios)
+            await _speak_briefing(ws, voice_state, lang, combined, response_text)
+        else:
+            await ws.send_json({"type": "text", "text": response_text})
+    except Exception:
+        pass
+
+    # End of briefing → look at the user and comment on their state/outfit (with
+    # the persona's wit). The long briefing is still playing while we capture +
+    # describe, so the comment is enqueued right after it with no gap. onFinished
+    # starts the mic once the comment finishes.
+    cam_text, cam_audio = await _camera_comment(ws, pending_frames, lang)
+    try:
+        if cam_audio:
+            await ws.send_json({"type": "audio", "data": base64.b64encode(cam_audio).decode(),
+                                "text": cam_text})
+        elif not audios:
+            await ws.send_json({"type": "status", "state": "idle"})
+    except Exception:
+        pass
+
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[morning briefing]: {response_text}"
+                                                          + (f" [look] {cam_text}" if cam_text else "")})
+    log.info(f"Briefing delivered ({lang}): {response_text[:80]}")
 
 
 def get_lookup_status() -> str:
@@ -1963,6 +3924,10 @@ async def voice_handler(ws: WebSocket):
     # Audio collision prevention — track when user last spoke
     voice_state = {"last_user_time": 0.0}
 
+    # Pending webcam frame requests — request_id -> Future resolved by the
+    # browser's "camera_frame" reply (see request_camera_frame).
+    pending_frames: dict[str, asyncio.Future] = {}
+
     # Self-awareness — track last spoken response to avoid repetition
     last_jarvis_response = ""
 
@@ -2012,32 +3977,130 @@ async def voice_handler(ws: WebSocket):
             return  # WebSocket already gone
 
         while True:
-            raw = await ws.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
+            message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
 
-            # ── Fix-self: activate work mode in JARVIS repo ──
-            if msg.get("type") == "fix_self":
-                jarvis_dir = str(Path(__file__).parent)
-                await work_session.start(jarvis_dir)
-                response_text = "Work mode active in my own repo, sir. Tell me what needs fixing."
-                tts = strip_markdown_for_tts(response_text)
-                await ws.send_json({"type": "status", "state": "speaking"})
-                audio = await synthesize_speech(tts)
-                if audio:
-                    await ws.send_json({"type": "audio", "data": audio, "text": response_text})
-                else:
-                    await ws.send_json({"type": "text", "text": response_text})
-                continue
+            # Per-turn telemetry (Phase 0). Lives for this loop iteration; the
+            # binary + text paths both feed the shared TTS/record block below.
+            _trace = None
 
-            if msg.get("type") != "transcript" or not msg.get("isFinal"):
-                continue
+            # ── Audio utterance (binary) → Whisper (forced lang if set) ──
+            if message.get("bytes") is not None:
+                forced = voice_state.get("forced_lang")
+                _trace = perf_monitor.start(forced or voice_state.get("lang", ""))
+                text, utter_lang = await transcribe_audio(message["bytes"], lang=forced)
+                _trace.mark("stt")
+                user_text = apply_speech_corrections(text.strip())
+                if not user_text:
+                    # Nothing intelligible — return the UI to idle so the mic
+                    # keeps listening instead of being stuck on "thinking".
+                    try:
+                        await ws.send_json({"type": "status", "state": "idle"})
+                    except Exception:
+                        pass
+                    continue
+            else:
+                raw = message.get("text")
+                if raw is None:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
 
-            user_text = apply_speech_corrections(msg.get("text", "").strip())
-            if not user_text:
-                continue
+                # ── Webcam frame reply: resolve the waiting request_camera_frame ──
+                if msg.get("type") == "camera_frame":
+                    rid = msg.get("request_id")
+                    fut = pending_frames.get(rid)
+                    if fut and not fut.done():
+                        fut.set_result(msg.get("data") or None)
+                    continue
+
+                # ── Language toggle: force Whisper + replies to a language ──
+                if msg.get("type") == "set_lang":
+                    lg = msg.get("lang")
+                    voice_state["forced_lang"] = lg if lg in ("en", "fr", "tr") else None
+                    log.info(f"Forced language set to: {voice_state.get('forced_lang')}")
+                    continue
+
+                # ── D-ID live stream lifecycle: the browser owns the WebRTC peer
+                #    connection and tells us its active stream so the reply path
+                #    can push lip-sync audio into it (instead of base64 audio). ──
+                if msg.get("type") == "did_stream_ready":
+                    voice_state["did_stream"] = {"id": msg.get("stream_id"), "session_id": msg.get("session_id")}
+                    log.info(f"D-ID live stream ready: {msg.get('stream_id')}")
+                    continue
+                if msg.get("type") == "did_stream_closed":
+                    voice_state.pop("did_stream", None)
+                    continue
+
+                # ── Surveillance: a webcam frame from the browser (motion-gated).
+                #    Recognise off the WS loop so it never delays voice. ──
+                if msg.get("type") == "watch_frame":
+                    if _surveillance["on"]:
+                        try:
+                            _data = (msg.get("data") or "").split(",")[-1]
+                            _frame = base64.b64decode(_data)
+                            asyncio.create_task(_recognize_and_greet(_frame))
+                        except Exception:
+                            pass
+                    continue
+
+                # ── Briefing prefetch: start gathering DURING the boot screen so
+                #    the briefing is ready the instant the boot finishes. ──
+                if msg.get("type") == "briefing_prefetch":
+                    if _briefing_done_today():
+                        log.info("Skipping briefing prefetch — already delivered today")
+                        continue
+                    # Pin the language carried by the message so the briefing never
+                    # composes/greets in the wrong language because of a set_lang ↔
+                    # briefing message-ordering race (Marion sounded English at boot).
+                    _ml = msg.get("lang")
+                    if _ml in ("en", "fr", "tr"):
+                        voice_state["forced_lang"] = _ml
+                    pf_lang = voice_state.get("forced_lang") or voice_state.get("lang") or "en"
+                    voice_state["briefing_task"] = asyncio.create_task(_prepare_briefing(pf_lang))
+                    log.info(f"Briefing prefetch started ({pf_lang})")
+                    continue
+
+                # ── Morning briefing: triggered automatically by the frontend after
+                #    startup (auto=True → skipped if already done today). Explicit
+                #    "brief me" requests below run unconditionally. ──
+                if msg.get("type") == "briefing":
+                    # Pin the message's language before the task reads it (same race
+                    # guard as the prefetch above).
+                    _ml = msg.get("lang")
+                    if _ml in ("en", "fr", "tr"):
+                        voice_state["forced_lang"] = _ml
+                    asyncio.create_task(morning_briefing(ws, history=history, voice_state=voice_state, auto=True, pending_frames=pending_frames))
+                    continue
+
+                # ── Fix-self: activate work mode in JARVIS repo ──
+                if msg.get("type") == "fix_self":
+                    jarvis_dir = str(Path(__file__).parent)
+                    await work_session.start(jarvis_dir)
+                    response_text = "Work mode active in my own repo, sir. Tell me what needs fixing."
+                    tts = strip_markdown_for_tts(response_text)
+                    await ws.send_json({"type": "status", "state": "speaking"})
+                    audio = await synthesize_speech(tts)
+                    if audio:
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
+                    else:
+                        await ws.send_json({"type": "text", "text": response_text})
+                    continue
+
+                # ── Legacy/browser STT transcript (English fallback path) ──
+                if msg.get("type") != "transcript" or not msg.get("isFinal"):
+                    continue
+                _trace = perf_monitor.start(voice_state.get("lang", "en"))
+                user_text = apply_speech_corrections(msg.get("text", "").strip())
+                utter_lang = "en"
+                if not user_text:
+                    continue
+
+            # Track this utterance's language — drives reply language + TTS voice.
+            voice_state["lang"] = utter_lang
 
             # Cancel any in-flight response
             _current_response_id += 1
@@ -2048,6 +4111,21 @@ async def voice_handler(ws: WebSocket):
 
             voice_state["last_user_time"] = time.time()
             log.info(f"User: {user_text}")
+
+            # Wake-word gate: while music is actually playing, the mic re-hears the
+            # speakers, so ignore anything that doesn't name Marion or command
+            # playback — this breaks the music→mic→music feedback loop.
+            if await _music_is_active() and not _passes_music_gate(user_text):
+                log.info(f"[music-gate] ignored during playback: {user_text!r}")
+                # Critical: the frontend already flipped to "thinking" when it sent
+                # this utterance. Send it back to idle so the mic resumes — without
+                # this it hangs forever on "listening/thinking" (the reported bug).
+                try:
+                    await ws.send_json({"type": "status", "state": "idle"})
+                except Exception:
+                    pass
+                continue
+
             await ws.send_json({"type": "status", "state": "thinking"})
 
             # Lazy project scan on first message
@@ -2112,6 +4190,86 @@ async def voice_handler(ws: WebSocket):
                         else:
                             response_text = result.get("next_question", "What else, sir?")
 
+                # ── "Let's go to hell" — easter egg: replay the boot jingle. ──
+                elif "go to hell" in t_lower:
+                    try:
+                        await ws.send_json({"type": "play_music"})
+                    except Exception:
+                        pass
+                    response_text = {"fr": "Comme tu veux, mon amour.",
+                                     "tr": "Nasıl istersen canım."}.get(
+                        voice_state.get("lang", "en"), "As you wish, sir.")
+
+                # ── Surveillance mode on/off (voice) — webcam face watch ──
+                elif any(p in t_lower for p in (
+                    "active la surveillance", "démarre la surveillance", "demarre la surveillance",
+                    "lance la surveillance", "mode surveillance", "surveille la maison",
+                    "mets la surveillance", "active la caméra de surveillance",
+                )):
+                    _surveillance["on"] = True
+                    try:
+                        await ws.send_json({"type": "watch_mode", "on": True})
+                    except Exception:
+                        pass
+                    response_text = {"fr": "Surveillance activée, mon amour. Je veille sur la maison.",
+                                     "tr": "Gözetim açık canım."}.get(
+                        voice_state.get("lang", "en"), "Surveillance on, sir.")
+
+                elif any(p in t_lower for p in (
+                    "désactive la surveillance", "desactive la surveillance",
+                    "arrête la surveillance", "arrete la surveillance",
+                    "coupe la surveillance", "stop la surveillance",
+                )):
+                    _surveillance["on"] = False
+                    try:
+                        await ws.send_json({"type": "watch_mode", "on": False})
+                    except Exception:
+                        pass
+                    response_text = {"fr": "Surveillance désactivée.",
+                                     "tr": "Gözetim kapalı canım."}.get(
+                        voice_state.get("lang", "en"), "Surveillance off, sir.")
+
+                # ── Real music control via Spotify (artist/title/playlist,
+                # pause, next). spotify_access.parse_command extracts the query
+                # from natural speech in FR/TR/EN. ──
+                elif (_music := spotify_access.parse_command(user_text)) is not None:
+                    _act, _query = _music
+                    _lang = voice_state.get("lang", "en")
+                    if not spotify_access.is_configured():
+                        response_text = {
+                            "fr": "Spotify n'est pas connecté, mon amour.",
+                            "tr": "Spotify bağlı değil canım.",
+                        }.get(_lang, "Spotify isn't connected, sir.")
+                    else:
+                        try:
+                            if _act == "pause":
+                                _res = await spotify_access.pause()
+                                _ok = {"fr": "Musique en pause.", "tr": "Müzik durduruldu."}.get(_lang, "Paused, sir.")
+                            elif _act == "next":
+                                _res = await spotify_access.next_track()
+                                _ok = {"fr": "Chanson suivante.", "tr": "Sonraki şarkı."}.get(_lang, "Skipped, sir.")
+                            elif _query:
+                                _res = await spotify_access.play(_query)
+                                _ok = {"fr": f"C'est parti : {_res.detail}.",
+                                       "tr": f"Çalıyorum: {_res.detail}."}.get(_lang, f"Playing {_res.detail}, sir.")
+                            else:
+                                _res = await spotify_access.play(None)
+                                _ok = {"fr": "Je relance la musique.", "tr": "Müziğe devam."}.get(_lang, "Resuming, sir.")
+                            if _res.ok:
+                                response_text = _ok
+                                _set_music_playing(_act != "pause")
+                            else:
+                                response_text = {
+                                    "fr": f"Je n'ai pas réussi, mon amour — {_res.detail}.",
+                                    "tr": f"Olmadı canım — {_res.detail}.",
+                                }.get(_lang, f"I couldn't start playback, sir — {_res.detail}.")
+                        except Exception as _e:
+                            log.warning(f"Spotify command failed: {_e}")
+                            response_text = {
+                                "fr": "J'ai eu un souci avec Spotify, mon amour.",
+                                "tr": "Spotify ile bir sorun oldu canım.",
+                            }.get(_lang, "I hit a Spotify error, sir.")
+
                 elif any(w in t_lower for w in ["quit work mode", "exit work mode", "go back to chat", "regular mode", "stop working"]):
                     if work_session.active:
                         await work_session.stop()
@@ -2128,6 +4286,7 @@ async def voice_handler(ws: WebSocket):
                             cached_projects, history,
                             last_response=last_jarvis_response,
                             session_summary=session_summary,
+                            lang=voice_state.get("lang", "en"),
                         )
                     else:
                         # Send to claude -p (full power)
@@ -2184,7 +4343,9 @@ async def voice_handler(ws: WebSocket):
 
                 # ── CHAT MODE: fast keyword detection + Haiku ──
                 else:
-                    action = detect_action_fast(user_text)
+                    # Fast keyword actions are English-only; for French/Turkish go
+                    # straight to the LLM so the reply comes back in-language.
+                    action = detect_action_fast(user_text) if voice_state.get("lang", "en") == "en" else None
 
                     if action:
                         if action["action"] == "open_terminal":
@@ -2193,7 +4354,16 @@ async def voice_handler(ws: WebSocket):
                             response_text = await handle_show_recent()
                         elif action["action"] == "describe_screen":
                             response_text = "Taking a look now, sir."
-                            asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
+                            asyncio.create_task(_lookup_and_report("screen", lambda: _do_screen_lookup(voice_state.get("lang", "en")), ws, history=history, voice_state=voice_state))
+                        elif action["action"] == "describe_camera":
+                            response_text = "Let me have a look, sir."
+                            asyncio.create_task(_lookup_and_report("camera", lambda: _do_camera_lookup(ws, pending_frames, voice_state.get("lang", "en")), ws, history=history, voice_state=voice_state))
+                        elif action["action"] == "market_sentiment":
+                            response_text = "Checking the crypto mood now, sir."
+                            asyncio.create_task(_lookup_and_report("sentiment", _do_sentiment_lookup, ws, history=history, voice_state=voice_state))
+                        elif action["action"] == "briefing":
+                            response_text = "Preparing your morning briefing, sir."
+                            asyncio.create_task(morning_briefing(ws, history=history, voice_state=voice_state, pending_frames=pending_frames))
                         elif action["action"] == "check_calendar":
                             response_text = "Checking your calendar now, sir."
                             asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
@@ -2232,6 +4402,7 @@ async def voice_handler(ws: WebSocket):
                                 cached_projects, history,
                                 last_response=last_jarvis_response,
                                 session_summary=session_summary,
+                                lang=voice_state.get("lang", "en"),
                             )
 
                             # Check for action tags embedded in LLM response
@@ -2242,15 +4413,24 @@ async def voice_handler(ws: WebSocket):
                                 # Ensure there's always something to speak
                                 if not response_text.strip():
                                     action_type = embedded_action["action"]
+                                    _lg = voice_state.get("lang", "en")
                                     if action_type == "prompt_project":
                                         proj = embedded_action["target"].split("|||")[0].strip()
-                                        response_text = f"Connecting to {proj} now, sir."
+                                        response_text = ({"fr": f"Connexion à {proj}, mon amour.",
+                                                          "tr": f"{proj} bağlanıyorum, canım."}
+                                                         .get(_lg, f"Connecting to {proj} now, sir."))
                                     elif action_type == "build":
-                                        response_text = "On it, sir."
+                                        response_text = {"fr": "Je m'en occupe, mon amour.",
+                                                         "tr": "Hallediyorum, canım."}.get(_lg, "On it, sir.")
                                     elif action_type == "research":
-                                        response_text = "Looking into that now, sir."
+                                        response_text = {"fr": "Je me renseigne, mon amour.",
+                                                         "tr": "Araştırıyorum, canım."}.get(_lg, "Looking into that now, sir.")
+                                    elif action_type == "outfit":
+                                        response_text = {"fr": "Voilà, mon amour.",
+                                                         "tr": "İşte, canım."}.get(_lg, "There we are, sir.")
                                     else:
-                                        response_text = "Right away, sir."
+                                        response_text = {"fr": "Tout de suite, mon amour.",
+                                                         "tr": "Hemen, canım."}.get(_lg, "Right away, sir.")
 
                                 if embedded_action["action"] == "build":
                                     # Build in background — JARVIS stays conversational
@@ -2348,7 +4528,40 @@ async def voice_handler(ws: WebSocket):
                                     else:
                                         asyncio.create_task(create_apple_note("JARVIS Note", target))
                                 elif embedded_action["action"] == "screen":
-                                    asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
+                                    asyncio.create_task(_lookup_and_report("screen", lambda: _do_screen_lookup(voice_state.get("lang", "en")), ws, history=history, voice_state=voice_state))
+                                elif embedded_action["action"] == "camera":
+                                    asyncio.create_task(_lookup_and_report("camera", lambda: _do_camera_lookup(ws, pending_frames, voice_state.get("lang", "en")), ws, history=history, voice_state=voice_state))
+                                elif embedded_action["action"] == "sentiment":
+                                    asyncio.create_task(_lookup_and_report("sentiment", _do_sentiment_lookup, ws, history=history, voice_state=voice_state))
+                                elif embedded_action["action"] == "lights":
+                                    # Marion's spoken reply already confirms; control runs in background.
+                                    asyncio.create_task(_execute_lights(embedded_action["target"], voice_state, ws))
+                                elif embedded_action["action"] == "gate":
+                                    asyncio.create_task(_execute_gate(voice_state, ws))
+                                elif embedded_action["action"] == "outfit":
+                                    # Change Marion's avatar look live (no reload). The
+                                    # frontend swaps the still + restarts the talking
+                                    # stream; a manual look overrides the weather until
+                                    # "auto". Her spoken reply confirms.
+                                    _look = (embedded_action.get("target") or "").strip().lower()
+                                    _look = {"bikini": "sun", "summer": "sun", "soleil": "sun",
+                                             "pluie": "rain", "umbrella": "rain", "parapluie": "rain",
+                                             "normal": "default", "normale": "default",
+                                             "meteo": "auto", "météo": "auto", "weather": "auto"}.get(_look, _look)
+                                    if _look not in ("sun", "rain", "default", "auto"):
+                                        _look = "auto"
+                                    await ws.send_json({"type": "set_look", "look": _look})
+                                elif embedded_action["action"] == "music":
+                                    # Marion's spoken reply confirms; playback runs in background.
+                                    asyncio.create_task(_execute_music(embedded_action["target"], voice_state, ws))
+                                elif embedded_action["action"] == "news":
+                                    _nlang = voice_state.get("lang", "en")
+                                    _nq = embedded_action["target"].strip() or user_text
+                                    asyncio.create_task(_lookup_and_report("news", lambda: _do_news_lookup(_nq, _nlang), ws, history=history, voice_state=voice_state))
+                                elif embedded_action["action"] == "weather":
+                                    _wlang = voice_state.get("lang", "en")
+                                    _wplace = embedded_action["target"].strip()
+                                    asyncio.create_task(_lookup_and_report("weather", lambda: _do_weather_lookup(_wplace, _wlang), ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "read_note":
                                     # Read note in background and report back
                                     async def _read_and_report(search_term, _ws):
@@ -2396,20 +4609,77 @@ async def voice_handler(ws: WebSocket):
                 if anthropic_client and len(user_text) > 15:
                     asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
 
-                # TTS
+                # TTS — voice follows the utterance's language (French → cloned voice)
+                # Daily self-improvement digest — once per day, on the first reply
+                # of the day, Marion mentions what she auto-adjusted.
+                try:
+                    _digest = self_eval.pop_due_digest(voice_state.get("lang", "en"))
+                    if _digest:
+                        response_text = f"{_digest} {response_text}"
+                except Exception:
+                    pass
+                # Phase 3: once-a-day spoken self-assessment summary.
+                try:
+                    _fd = self_formation.pop_due_digest(voice_state.get("lang", "en"))
+                    if _fd:
+                        response_text = f"{_fd} {response_text}"
+                except Exception:
+                    pass
+                # Phase 0: time from end-of-transcription to here = classify +
+                # action + reply generation (the "reason" bucket).
+                if _trace:
+                    _trace.mark("reason")
                 tts = strip_markdown_for_tts(response_text)
+                _lang = voice_state.get("lang", "en")
                 await ws.send_json({"type": "status", "state": "speaking"})
-                audio = await synthesize_speech(tts)
+                audio = await synthesize_speech(tts, lang=_lang)
+                if _trace:
+                    _trace.mark("tts")
                 if audio:
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
+                    # FR/TR personas (Marion): if a live D-ID WebRTC stream is open,
+                    # push the Fish audio into it → Marion lip-syncs in real time
+                    # (~1-2s). The video arrives over the peer connection, so we send
+                    # NO base64 audio and the frontend returns to idle on the stream's
+                    # "done" event. Any failure / no stream → static face + plain audio.
+                    spoke_via_stream = False
+                    _stream = voice_state.get("did_stream") if _lang in ("fr", "tr") else None
+                    log.info(f"reply lang={_lang} live_stream={'yes' if _stream else 'no'}")
+                    if _stream and did_avatar.is_enabled():
+                        _dur = await did_avatar.stream_speak(
+                            _stream["id"], _stream["session_id"], audio)
+                        log.info(f"stream_speak -> {_dur}")
+                        if _dur:
+                            spoke_via_stream = True
+                            # Send the duration so the client resumes the mic exactly
+                            # when she finishes — independent of D-ID's flaky events.
+                            await ws.send_json({"type": "avatar_stream_speak", "text": response_text, "duration": _dur})
+                    if not spoke_via_stream:
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
                 else:
                     await ws.send_json({"type": "text", "text": response_text})
                     await ws.send_json({"type": "status", "state": "idle"})
                 log.info(f"JARVIS: {response_text}")
+                # Self-eval (Phase 1): record the turn + run the background critic
+                # (auto-learns vocab/preferences, auto-tunes brevity). Fire-and-
+                # forget — adds no latency and never breaks the reply.
+                try:
+                    await self_eval.record_turn(
+                        anthropic_client,
+                        user_text=user_text, reply_text=response_text,
+                        lang=_lang, prev_reply=last_jarvis_response,
+                    )
+                except Exception:
+                    pass
+                # Phase 0: close the trace → persist timings + live bug flags.
+                if _trace:
+                    _trace.finish(user_text, response_text)
                 last_jarvis_response = response_text
 
             except Exception as e:
                 log.error(f"Error: {e}", exc_info=True)
+                if _trace:
+                    _trace.finish(locals().get("user_text", ""),
+                                  locals().get("response_text", ""), error=str(e))
                 try:
                     fallback = "Something went wrong, sir."
                     audio = await synthesize_speech(fallback)
@@ -2491,20 +4761,24 @@ class PreferencesUpdate(BaseModel):
 
 @app.post("/api/settings/keys")
 async def api_settings_keys(body: KeyUpdate):
-    allowed = {"ANTHROPIC_API_KEY", "FISH_API_KEY", "FISH_VOICE_ID", "USER_NAME", "HONORIFIC", "CALENDAR_ACCOUNTS"}
+    allowed = {"ANTHROPIC_API_KEY", "FISH_API_KEY", "FISH_VOICE_ID", "USER_NAME", "HONORIFIC", "CALENDAR_ACCOUNTS", "GOOGLE_MAPS_API_KEY", "DID_API_KEY"}
     if body.key_name not in allowed:
         return JSONResponse({"success": False, "error": "Invalid key name"}, status_code=400)
     _write_env_key(body.key_name, body.key_value)
     return {"success": True}
 
-@app.post("/api/settings/test-anthropic")
-async def api_test_anthropic(body: KeyTest):
-    key = body.key_value or os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        return {"valid": False, "error": "No key provided"}
+@app.post("/api/settings/test-ollama")
+async def api_test_ollama(body: KeyTest):
     try:
-        client = anthropic.AsyncAnthropic(api_key=key)
-        await client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=10, messages=[{"role": "user", "content": "Hi"}])
+        client = AsyncOpenAI(
+            base_url="http://localhost:11434/v1",
+            api_key="ollama",
+        )
+        await client.chat.completions.create(
+            model="gemma3:27b",
+            max_tokens=10,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
         return {"valid": True}
     except Exception as e:
         return {"valid": False, "error": str(e)[:200]}
@@ -2629,11 +4903,26 @@ from starlette.responses import FileResponse
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 if FRONTEND_DIST.exists():
+    _NOCACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
+
     @app.get("/")
     async def serve_index():
-        return FileResponse(str(FRONTEND_DIST / "index.html"))
+        # Never cache index.html — it references hash-named bundles that change on
+        # every build; a stale index points at a deleted bundle and the app dies.
+        return FileResponse(str(FRONTEND_DIST / "index.html"), headers=_NOCACHE)
 
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
+    # Serve the built public files (marion-cutout.png, boot_*.mp3, boot_cue.json…)
+    # so the production URL (:8340) is fully self-contained — no vite dev server,
+    # hence no HMR page reloads mid-build. Defined LAST so it never shadows the
+    # /api and /ws routes above; unknown paths fall back to index.html (SPA).
+    @app.get("/{path:path}")
+    async def serve_static(path: str):
+        candidate = (FRONTEND_DIST / path).resolve()
+        if FRONTEND_DIST.resolve() in candidate.parents and candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(FRONTEND_DIST / "index.html"), headers=_NOCACHE)
 
 
 # ---------------------------------------------------------------------------
@@ -2679,3 +4968,4 @@ if __name__ == "__main__":
         log_level="info",
         **ssl_kwargs,
     )
+   
