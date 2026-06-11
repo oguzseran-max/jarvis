@@ -50,6 +50,7 @@ from memory import (
     format_tasks_for_voice, extract_memories, get_important_memories,
 )
 from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
+from tradingview_access import get_quote_summary, get_market_overview, resolve_chart_url
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
 
@@ -112,6 +113,7 @@ YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT N
 - You CAN manage tasks — create, complete, and list to-do items with priorities and due dates
 - You CAN help plan {user_name}'s day — combine calendar events, tasks, and priorities into an organized plan
 - You CAN remember facts about {user_name} — preferences, decisions, goals. Use [ACTION:REMEMBER] to store important info.
+- You CAN check live market data via TradingView — stock prices, crypto, indices — and open TradingView charts in Chrome
 
 DAY PLANNING:
 When {user_name} asks to plan his day or schedule, DO NOT dispatch to a project. Instead:
@@ -204,6 +206,11 @@ CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're
 - [ACTION:CREATE_NOTE] title ||| body — create a new Apple Note. For saving plans, ideas, lists.
   "save that as a note" → [ACTION:CREATE_NOTE] Day Plan March 19 ||| Morning: client calls. Afternoon: TikTok dashboard. Evening: JARVIS improvements.
 - [ACTION:READ_NOTE] title search — read an existing Apple Note by title keyword.
+- [ACTION:MARKET] symbol or company name — fetch a live quote (stocks, crypto, indices) from TradingView. Use "overview" for a summary of the major indices.
+  "how's Tesla doing today" → [ACTION:MARKET] Tesla
+  "how are the markets" → [ACTION:MARKET] overview
+- [ACTION:CHART] symbol or company name — open the TradingView chart in Chrome.
+  "pull up the Bitcoin chart" → [ACTION:CHART] Bitcoin
 
 You use Claude Code as your tool to build, research, and write code — but YOU are the one doing the work. Never say "Claude Code did X" or "Claude Code is asking" — say "I built X", "I'm checking on that", "I found X". You ARE the intelligence. Claude Code is just your hands.
 
@@ -814,7 +821,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|MARKET|CHART)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -1583,6 +1590,13 @@ def detect_action_fast(text: str) -> dict | None:
                              "my todo", "what do i need to do", "open tasks", "task list"]):
         return {"action": "check_tasks"}
 
+    # Market overview — explicit market requests
+    if any(p in t for p in ["how's the market", "hows the market", "how are the markets",
+                             "how're the markets", "check the markets", "check the market",
+                             "market update", "market overview", "market status",
+                             "market summary", "how did the markets"]):
+        return {"action": "check_market"}
+
     # Usage / cost check
     if any(p in t for p in ["usage", "how much have you cost", "how much am i spending",
                              "what's the cost", "whats the cost", "api cost", "token usage",
@@ -2219,6 +2233,9 @@ async def voice_handler(ws: WebSocket):
                         elif action["action"] == "check_tasks":
                             tasks = get_open_tasks()
                             response_text = format_tasks_for_voice(tasks)
+                        elif action["action"] == "check_market":
+                            response_text = "Checking the markets now, sir."
+                            asyncio.create_task(_lookup_and_report("market", get_market_overview, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_usage":
                             response_text = get_usage_summary()
                         else:
@@ -2249,6 +2266,10 @@ async def voice_handler(ws: WebSocket):
                                         response_text = "On it, sir."
                                     elif action_type == "research":
                                         response_text = "Looking into that now, sir."
+                                    elif action_type == "market":
+                                        response_text = "Checking the markets now, sir."
+                                    elif action_type == "chart":
+                                        response_text = "Pulling up the chart, sir."
                                     else:
                                         response_text = "Right away, sir."
 
@@ -2365,6 +2386,21 @@ async def voice_handler(ws: WebSocket):
                                             except Exception:
                                                 pass
                                     asyncio.create_task(_read_and_report(embedded_action["target"].strip(), ws))
+                                elif embedded_action["action"] == "market":
+                                    target = embedded_action["target"].strip()
+                                    if not target or target.lower() in ("overview", "markets", "the markets", "the market"):
+                                        lookup_fn = get_market_overview
+                                    else:
+                                        def lookup_fn(q=target):
+                                            return get_quote_summary(q)
+                                    asyncio.create_task(_lookup_and_report("market", lookup_fn, ws, history=history, voice_state=voice_state))
+                                elif embedded_action["action"] == "chart":
+                                    async def _open_chart(q):
+                                        try:
+                                            await open_browser(await resolve_chart_url(q))
+                                        except Exception as e:
+                                            log.error(f"Chart open failed: {e}")
+                                    asyncio.create_task(_open_chart(embedded_action["target"].strip()))
 
                 # Update history
                 history.append({"role": "user", "content": user_text})

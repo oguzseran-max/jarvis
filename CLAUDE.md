@@ -34,6 +34,7 @@ When a user clones this repo and starts Claude Code, help them:
 - `mail_access.py` — Apple Mail integration (READ-ONLY)
 - `notes_access.py` — Apple Notes integration
 - `actions.py` — System actions (Terminal, Chrome, Claude Code)
+- `tradingview_access.py` — Live market quotes via TradingView public endpoints
 - `browser.py` — Playwright web automation
 - `work_mode.py` — Persistent Claude Code sessions
 

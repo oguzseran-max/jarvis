@@ -148,6 +148,7 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
 | `mail_access.py` | Apple Mail integration (read-only) |
 | `notes_access.py` | Apple Notes integration |
 | `actions.py` | System actions (Terminal, Chrome, Claude Code) |
+| `tradingview_access.py` | Live market quotes via TradingView public endpoints |
 | `browser.py` | Playwright web automation |
 | `work_mode.py` | Persistent Claude Code sessions |
 | `planner.py` | Multi-step task planning with smart questions |
@@ -162,6 +163,8 @@ JARVIS uses action tags to trigger real system actions:
 - `[ACTION:PROMPT_PROJECT]` -- connects to an existing project via Claude Code
 - `[ACTION:ADD_TASK]` -- creates a tracked task with priority and due date
 - `[ACTION:REMEMBER]` -- stores a fact for future context
+- `[ACTION:MARKET]` -- fetches a live quote (stocks, crypto, indices) from TradingView
+- `[ACTION:CHART]` -- opens a TradingView chart in Chrome
 
 ### Memory System
 JARVIS remembers things you tell it using SQLite with FTS5 full-text search. Preferences, decisions, and facts persist across sessions.
