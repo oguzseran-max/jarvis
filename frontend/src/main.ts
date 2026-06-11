@@ -74,6 +74,15 @@ const orb = createOrb(canvas);
 const marion = createMarion("/marion-cutout.png");
 // Languages that show Marion's face rather than the orb.
 const FACE_LANGS = new Set(["fr", "tr"]);
+// Lip-sync (D-ID WebRTC) toggle. OFF for now: Marion runs voice-only — the still
+// portrait reacts to her Fish-Audio voice (the shared analyser), and the backend
+// streams base64 audio because no D-ID stream is ever registered. Flip to `true`
+// to bring real-time lip-sync back online (the stream wiring below is intact).
+const LIPSYNC_ENABLED = false;
+// Marion's portrait toggle. OFF for now: the FR/TR personas stay on the orb
+// (no face shown) — only the voice changes per language. Flip to `true` to bring
+// her portrait back. Gates the whole face path via `showFace` in setLanguage().
+const SHOW_MARION_FACE = false;
 const cornerHud = createCornerHud(); // persistent 4-corner monitoring panels
 const securityHud = createSecurityHud(); // mid-left live WatchGuard threat panel
 const perfHud = createPerfHud(); // left-side live voice-loop telemetry (Phase 0)
@@ -192,7 +201,7 @@ const weather = createWeather((look) => {
   // still CONNECTING (`starting`) — at boot the stream pre-connects with
   // "default" before the weather is known, so without this the live video would
   // stay on the default look even once the weather resolves to rain/sun.
-  if (marionStream.active || marionStream.starting) marionStream.restart();
+  if (LIPSYNC_ENABLED && (marionStream.active || marionStream.starting)) marionStream.restart();
 });
 // NB: weather.start() is called *after* marionStream is declared below — with a
 // preview hash (#rain/#clear) it fires onLook synchronously, which touches
@@ -226,7 +235,7 @@ const marionStream: MarionStream = createMarionStream({
     marion.hideLiveStream();
     // D-ID idles a stream out after a few quiet minutes. If we're still on a
     // face persona, transparently reopen it so the next reply lip-syncs.
-    if (FACE_LANGS.has(currentLang)) setTimeout(() => marionStream.start(), 3000);
+    if (LIPSYNC_ENABLED && FACE_LANGS.has(currentLang)) setTimeout(() => marionStream.start(), 3000);
   },
   getLook: () => currentLook,  // weather-appropriate portrait for the talking video
 });
@@ -603,7 +612,7 @@ function startBoot() {
   // Pre-connect Marion's live stream during the boot if she's the active
   // persona, so the ~2-3s WebRTC handshake is hidden behind the boot screen
   // and she's already online (warmed up) the instant the boot ends.
-  if (FACE_LANGS.has(currentLang)) marionStream.start();
+  if (LIPSYNC_ENABLED && FACE_LANGS.has(currentLang)) marionStream.start();
 }
 
 // Boot needs a user gesture (audio autoplay). Start it on the first click.
@@ -657,7 +666,7 @@ function setLanguage(lang: string) {
   socket.send({ type: "set_lang", lang });
   // FR/TR personas show Marion's face; English stays on the orb. Hide the orb
   // canvas when the face is up so only one visualization is ever visible.
-  const showFace = FACE_LANGS.has(lang);
+  const showFace = SHOW_MARION_FACE && FACE_LANGS.has(lang);
   marion.setVisible(showFace);
   // Keep the orb rendering; .marion-mode shrinks it into a core behind Marion.
   document.body.classList.toggle("marion-mode", showFace);
@@ -665,8 +674,9 @@ function setLanguage(lang: string) {
   // In Marion mode, dim the orb's bright core while she speaks so it doesn't
   // wash her out (she's screen-blended in front of it).
   orb.setDimOnSpeak(showFace);
-  // Open/close the live D-ID stream to match the persona.
-  if (showFace) marionStream.start();
+  // Open/close the live D-ID stream to match the persona (only when lip-sync is
+  // enabled; voice-only otherwise). Always stop on non-face langs as a safety net.
+  if (LIPSYNC_ENABLED && showFace) marionStream.start();
   else marionStream.stop();
   console.log("[lang] set to", lang);
 }

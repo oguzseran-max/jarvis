@@ -20,7 +20,7 @@ interface SeStats {
 
 const CSS = `
 #evo-hud {
-  position: fixed; left: 22px; top: 50%; transform: translateY(-50%);
+  position: fixed; left: 22px; top: 50%; transform: translateY(calc(-50% + 33vh));
   width: 270px; z-index: 4; pointer-events: none;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   color: rgba(${C}, 0.92);

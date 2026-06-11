@@ -23,9 +23,16 @@ __pycache__/
 data/*.jsonl
 data/active_session.json
 data/.jarvis_output.txt
+# D-ID source-image URL caches — D-ID image URLs expire, so these are
+# regenerated at runtime; versioning a stale URL re-breaks Marion's lip-sync.
+data/did_source_*.txt
 
 # Certificates
 *.pem
+# Backup copies of certs/keys (the *.pem rule misses the .bak suffix — and these
+# can hold a PRIVATE KEY, so never commit them).
+*.pem.*.bak
+*.bak
 
 # Build
 dist/
@@ -65,3 +72,11 @@ data/face_db.npz
 
 # Personal reference media (car photo etc.)
 references/
+
+# Personal voice samples & cloning references (voice biometrics of real people —
+# same policy as faces/: NEVER commit). assets/ is a local boot-build input dir
+# holding these source recordings; the produced boot audio (frontend/public/
+# boot_voice_*) is what the app actually ships.
+voice_samples/
+assets/
+tools/boot_build/*_ref.mp3

@@ -1,0 +1,46 @@
+# Noms d'artistes / groupes / chansons pour amorcer Whisper (contexte français).
+# Un par ligne (les virgules marchent aussi). Les lignes # sont ignorées.
+# Auto-complété par tools/sync_music_vocab.py depuis Spotify ; garde ce socle court.
+# --- favoris connus du foyer ---
+Dire Straits
+Sultans of Swing
+Phil Collins
+Angèle
+Ministère AMER
+Stromae
+Bruxelles je t'aime
+# --- francophone populaire ---
+Daft Punk
+Orelsan
+Gims
+Indila
+Aya Nakamura
+Soprano
+Clara Luciani
+Julien Doré
+Vianney
+Louane
+Slimane
+Jacques Brel
+Édith Piaf
+Johnny Hallyday
+Zaz
+Christine and the Queens
+# --- international populaire (les noms ne dépendent pas de la langue) ---
+Dua Lipa
+The Weeknd
+Billie Eilish
+Daft Punk
+Coldplay
+Rihanna
+Beyoncé
+Adele
+Eminem
+Michael Jackson
+David Bowie
+Queen
+Pink Floyd
+# --- chansons souvent mal entendues ---
+Alors on danse
+Formidable
+La Bohème

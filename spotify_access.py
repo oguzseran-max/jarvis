@@ -59,8 +59,10 @@ REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN", "").strip()
 DEVICE_NAME = os.getenv("SPOTIFY_DEVICE_NAME", "").strip()
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback").strip()
 
-# Scopes needed to read devices/playback and control playback.
-SCOPES = "user-read-playback-state user-modify-playback-state"
+# Scopes needed to read devices/playback, control playback, and read the user's
+# top artists/tracks (user-top-read — used by tools/sync_music_vocab.py to prime
+# Whisper with the music names he actually listens to).
+SCOPES = "user-read-playback-state user-modify-playback-state user-top-read"
 
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 AUTH_URL = "https://accounts.spotify.com/authorize"
@@ -158,6 +160,46 @@ async def get_devices(token: str | None = None) -> list[dict]:
     if not resp or resp.status_code != 200:
         return []
     return resp.json().get("devices", [])
+
+
+# ---------------------------------------------------------------------------
+# Top artists / tracks (for priming Whisper with the user's actual music)
+# ---------------------------------------------------------------------------
+
+async def get_top_artists(limit: int = 30, time_range: str = "medium_term",
+                          token: str | None = None) -> list[str]:
+    """The user's most-listened artist names. Needs the user-top-read scope.
+
+    time_range: short_term (~4 weeks) | medium_term (~6 months) | long_term.
+    """
+    token = token or await get_access_token()
+    if not token:
+        return []
+    resp = await _api("GET", f"/me/top/artists?limit={min(limit, 50)}&time_range={time_range}", token)
+    if not resp or resp.status_code != 200:
+        if resp is not None and resp.status_code == 403:
+            log.warning("Spotify top-artists 403 — re-auth needed to grant user-top-read")
+        return []
+    return [a["name"] for a in resp.json().get("items", []) if a.get("name")]
+
+
+async def get_top_tracks(limit: int = 30, time_range: str = "medium_term",
+                         token: str | None = None) -> list[dict]:
+    """The user's most-played tracks as {name, artist}. Needs user-top-read."""
+    token = token or await get_access_token()
+    if not token:
+        return []
+    resp = await _api("GET", f"/me/top/tracks?limit={min(limit, 50)}&time_range={time_range}", token)
+    if not resp or resp.status_code != 200:
+        return []
+    out = []
+    for t in resp.json().get("items", []):
+        name = t.get("name")
+        artists = t.get("artists", [])
+        artist = artists[0]["name"] if artists and artists[0].get("name") else ""
+        if name:
+            out.append({"name": name, "artist": artist})
+    return out
 
 
 def _match_device(devices: list[dict], name: str) -> dict | None:
@@ -350,9 +392,17 @@ def parse_command(text: str):
     if any(p in pad for p in _NEXT_PHRASES):
         return ("next", None)
 
-    has_music = any(w in pad for w in _MUSIC_WORDS)
+    # Play requires an explicit play VERB ("mets", "joue", …). A bare mention of
+    # "musique" must NOT auto-play — otherwise complaints ("je ne t'ai pas demandé
+    # de changer de musique") or lyrics the mic caught trigger random playback.
+    # When the verb is garbled by speech-to-text the LLM's [ACTION:MUSIC] fallback
+    # handles it instead.
     has_verb = any(f" {v} " in pad or t.startswith(f"{v} ") for v in _PLAY_VERBS)
-    if not (has_music or has_verb):
+    if not has_verb:
+        return None
+    # Only fast-path short imperatives; longer, sentence-like utterances (questions,
+    # complaints, mis-heard song lyrics) go to the LLM, which judges intent in context.
+    if len(t.split()) > 7:
         return None
 
     # Build the search query: cut everything up to and including the last play

@@ -73,19 +73,38 @@ def _headers(json: bool = True) -> dict:
     return h
 
 
-async def _get_source_url(http: httpx.AsyncClient, look: str = "default") -> Optional[str]:
-    """Upload the look's portrait to D-ID once; reuse the hosted URL thereafter.
-    Cached per look on disk (data/did_source_<look>.txt)."""
+def _invalidate_source_url(look: str = "default") -> None:
+    """Drop a stale hosted URL (D-ID image URLs expire) so the next call
+    re-uploads. Clears both the in-process cache and the on-disk cache."""
     if look not in _SOURCES:
         look = "default"
-    if _source_urls.get(look):
-        return _source_urls[look]
+    _source_urls.pop(look, None)
     cache = _REPO / "data" / f"did_source_{look}.txt"
-    if cache.exists():
-        cached = cache.read_text().strip()
-        if cached:
-            _source_urls[look] = cached
-            return cached
+    try:
+        cache.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+async def _get_source_url(http: httpx.AsyncClient, look: str = "default",
+                          force: bool = False) -> Optional[str]:
+    """Upload the look's portrait to D-ID once; reuse the hosted URL thereafter.
+    Cached per look on disk (data/did_source_<look>.txt). `force` bypasses the
+    cache and re-uploads — D-ID image URLs expire, so a cached URL eventually
+    yields a 500 'Stream Error' until refreshed."""
+    if look not in _SOURCES:
+        look = "default"
+    if not force:
+        if _source_urls.get(look):
+            return _source_urls[look]
+        cache = _REPO / "data" / f"did_source_{look}.txt"
+        if cache.exists():
+            cached = cache.read_text().strip()
+            if cached:
+                _source_urls[look] = cached
+                return cached
+    else:
+        cache = _REPO / "data" / f"did_source_{look}.txt"
     img = _SOURCES[look]
     if not img.exists():
         log.error(f"D-ID source image missing: {img}")
@@ -139,6 +158,14 @@ async def render_talk(audio: bytes) -> Optional[str]:
                 "config": {"stitch": True},
             }
             r = await http.post(f"{DID_API_URL}/talks", headers=_headers(), json=body)
+            # Expired cached source URL → 5xx; retry once with a fresh upload.
+            if r.status_code >= 500:
+                log.warning(f"D-ID talk create failed: {r.status_code} {r.text[:200]} — re-uploading source")
+                _invalidate_source_url("default")
+                source_url = await _get_source_url(http, "default", force=True)
+                if source_url:
+                    body["source_url"] = source_url
+                    r = await http.post(f"{DID_API_URL}/talks", headers=_headers(), json=body)
             if r.status_code not in (200, 201):
                 log.error(f"D-ID talk create failed: {r.status_code} {r.text[:200]}")
                 return None
@@ -193,6 +220,16 @@ async def create_stream(look: str = "default") -> Optional[dict]:
                 return None
             r = await http.post(f"{DID_API_URL}/talks/streams",
                                 headers=_headers(), json={"source_url": source_url})
+            # A cached source URL that D-ID has since expired returns a 5xx
+            # ('Stream Error'). Invalidate it and retry once with a fresh upload.
+            # (4xx like 403 'Max user sessions' aren't a source problem — skip.)
+            if r.status_code >= 500:
+                log.warning(f"D-ID stream create failed: {r.status_code} {r.text[:200]} — re-uploading source")
+                _invalidate_source_url(look)
+                source_url = await _get_source_url(http, look, force=True)
+                if source_url:
+                    r = await http.post(f"{DID_API_URL}/talks/streams",
+                                        headers=_headers(), json={"source_url": source_url})
             if r.status_code not in (200, 201):
                 log.error(f"D-ID stream create failed: {r.status_code} {r.text[:200]}")
                 return None
@@ -263,9 +300,17 @@ async def stream_speak(stream_id: str, session_id: str, audio: bytes) -> Optiona
 
 
 async def close_stream(stream_id: str, session_id: str) -> None:
+    # Teardown is HTTP DELETE on the stream resource. NB: a POST to
+    # `/talks/streams/{id}/delete` is NOT a real endpoint — it 403s at the
+    # gateway, leaving the stream OPEN; on the lite plan those orphans pile up
+    # until "Max user sessions reached" and Marion can no longer lip-sync.
+    if not stream_id:
+        return
     try:
         async with httpx.AsyncClient(timeout=10.0) as http:
-            await http.post(f"{DID_API_URL}/talks/streams/{stream_id}/delete",
-                            headers=_headers(), json={"session_id": session_id})
+            r = await http.request("DELETE", f"{DID_API_URL}/talks/streams/{stream_id}",
+                                   headers=_headers(), json={"session_id": session_id})
+            if r.status_code not in (200, 201, 204, 404):
+                log.warning(f"D-ID close_stream unexpected: {r.status_code} {r.text[:120]}")
     except Exception as e:
         log.debug(f"D-ID close_stream error: {e}")
