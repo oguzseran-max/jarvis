@@ -309,6 +309,172 @@ async def get_chrome_tab_info() -> dict:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# SMB file sharing — expose a folder to iPhone/iPad over the local network
+# ---------------------------------------------------------------------------
+
+DEFAULT_SHARE_FOLDER = "~/Documents"
+
+
+async def _run_cmd(cmd: list, timeout: float = 10.0) -> tuple[int, str, str]:
+    """Run a subprocess and return (returncode, stdout, stderr)."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
+
+
+async def get_local_ip() -> str | None:
+    """Return the Mac's LAN IPv4 address.
+
+    Tries the common interfaces (Wi-Fi en0, Ethernet en1/en2) directly, then
+    falls back to whichever interface the routing table uses for the default
+    route. Returns None if no address could be determined.
+    """
+    for iface in ("en0", "en1", "en2"):
+        try:
+            rc, out, _ = await _run_cmd(["ipconfig", "getifaddr", iface], timeout=5)
+            if rc == 0 and out:
+                return out
+        except Exception:
+            continue
+    # Fallback: ask the routing table which interface reaches the internet.
+    try:
+        rc, out, _ = await _run_cmd(["route", "-n", "get", "default"], timeout=5)
+        if rc == 0:
+            m = re.search(r"interface:\s*(\S+)", out)
+            if m:
+                rc2, out2, _ = await _run_cmd(["ipconfig", "getifaddr", m.group(1)], timeout=5)
+                if rc2 == 0 and out2:
+                    return out2
+    except Exception:
+        pass
+    return None
+
+
+def _share_name(folder: str) -> str:
+    """Derive a share point name from a folder path (basename, never empty)."""
+    name = Path(os.path.expanduser(folder)).name
+    return name or "Share"
+
+
+async def enable_smb_share(folder: str = DEFAULT_SHARE_FOLDER) -> dict:
+    """Enable SMB file sharing for `folder` and return the smb:// URL to use.
+
+    Finds the Mac's LAN IP, turns on the SMB service (smbd), and registers the
+    folder as a share point. Enabling smbd and adding a share point both need
+    administrator rights, so those steps run through AppleScript's
+    `with administrator privileges`, which prompts for the password via the
+    macOS GUI — no plaintext password is handled here.
+
+    Returns {"success": bool, "confirmation": str, "smb_url": str|None,
+             "ip": str|None, "share": str}.
+    """
+    expanded = os.path.expanduser(folder)
+    path_obj = Path(expanded)
+    share = _share_name(expanded)
+
+    if not path_obj.is_dir():
+        return {
+            "success": False,
+            "confirmation": f"I couldn't find the folder {folder}, sir.",
+            "smb_url": None,
+            "ip": None,
+            "share": share,
+        }
+
+    # Resolve the LAN IP first so we can report it even if sharing is already on.
+    ip = await get_local_ip()
+
+    # Privileged shell: enable + start smbd, then register the share point.
+    # `sharing -a` adds an SMB share point; `-s 001` = SMB protocol on (the
+    # three digits map to AFP/FTP/SMB). If the share already exists, `-a`
+    # fails, so we fall back to `-e` (edit) to make the call idempotent.
+    quoted = expanded.replace("\\", "\\\\").replace('"', '\\"')
+    quoted_share = share.replace("\\", "\\\\").replace('"', '\\"')
+    shell_cmd = (
+        "/bin/launchctl enable system/com.apple.smbd; "
+        "/bin/launchctl load -w /System/Library/LaunchDaemons/com.apple.smbd.plist 2>/dev/null; "
+        f'/usr/sbin/sharing -a "{quoted}" -S "{quoted_share}" -s 001 2>/dev/null '
+        f'|| /usr/sbin/sharing -e "{quoted_share}" -S "{quoted_share}" -s 001 2>/dev/null; '
+        "/bin/echo JARVIS_SMB_OK"
+    )
+
+    # Embed in AppleScript so the GUI password prompt appears.
+    as_cmd = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'do shell script "{as_cmd}" with administrator privileges'
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+        out = stdout.decode().strip()
+        err = stderr.decode().strip()
+        success = proc.returncode == 0 and "JARVIS_SMB_OK" in out
+    except asyncio.TimeoutError:
+        return {
+            "success": False,
+            "confirmation": "Setting up file sharing timed out, sir.",
+            "smb_url": None,
+            "ip": ip,
+            "share": share,
+        }
+    except Exception as e:
+        log.error(f"enable_smb_share failed: {e}")
+        return {
+            "success": False,
+            "confirmation": "I ran into a problem enabling file sharing, sir.",
+            "smb_url": None,
+            "ip": ip,
+            "share": share,
+        }
+
+    if not success:
+        # -128 is the AppleScript code for "user cancelled" the auth dialog.
+        if "-128" in err or "User canceled" in err:
+            msg = "You cancelled the authorisation, sir, so file sharing wasn't enabled."
+        else:
+            log.error(f"enable_smb_share osascript error: {err[:200]}")
+            msg = "I couldn't enable file sharing — it needs administrator approval, sir."
+        return {
+            "success": False,
+            "confirmation": msg,
+            "smb_url": None,
+            "ip": ip,
+            "share": share,
+        }
+
+    if not ip:
+        return {
+            "success": True,
+            "confirmation": (
+                f"Your {share} folder is now shared, sir, but I couldn't determine "
+                "the Mac's local IP — check you're connected to a network."
+            ),
+            "smb_url": None,
+            "ip": None,
+            "share": share,
+        }
+
+    smb_url = f"smb://{ip}/{quote(share)}"
+    return {
+        "success": True,
+        "confirmation": (
+            f"Done, sir. Your {share} folder is shared over the network. "
+            f"From your iPhone's Files app, tap Connect to Server and enter {smb_url}."
+        ),
+        "smb_url": smb_url,
+        "ip": ip,
+        "share": share,
+    }
+
+
 async def monitor_build(project_dir: str, ws=None, synthesize_fn=None) -> None:
     """Monitor a Claude Code build for completion. Notify via WebSocket when done."""
     import base64

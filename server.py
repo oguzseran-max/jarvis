@@ -39,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal, applescript_escape
+from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal, applescript_escape, enable_smb_share
 from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
 from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
@@ -204,6 +204,9 @@ CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're
 - [ACTION:CREATE_NOTE] title ||| body — create a new Apple Note. For saving plans, ideas, lists.
   "save that as a note" → [ACTION:CREATE_NOTE] Day Plan March 19 ||| Morning: client calls. Afternoon: TikTok dashboard. Evening: JARVIS improvements.
 - [ACTION:READ_NOTE] title search — read an existing Apple Note by title keyword.
+- [ACTION:SHARE_FILES] folder — enable SMB file sharing for a folder so it can be reached from an iPhone/iPad over the local network. The folder is optional and defaults to ~/Documents. Use when the user wants to share files, access a folder from their phone, or set up an smb:// address. Requires an admin password prompt on the Mac.
+  "share my Documents folder with my iPhone" → [ACTION:SHARE_FILES] ~/Documents
+  "let me get to my Desktop from my phone" → [ACTION:SHARE_FILES] ~/Desktop
 
 You use Claude Code as your tool to build, research, and write code — but YOU are the one doing the work. Never say "Claude Code did X" or "Claude Code is asking" — say "I built X", "I'm checking on that", "I found X". You ARE the intelligence. Claude Code is just your hands.
 
@@ -814,7 +817,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|SHARE_FILES)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -952,6 +955,45 @@ async def _execute_open_terminal():
         await handle_open_terminal()
     except Exception as e:
         log.error(f"Open terminal failed: {e}")
+
+
+async def _execute_share_files(folder: str, ws=None, history: list = None, voice_state: dict = None):
+    """Enable SMB file sharing for a folder and report the smb:// URL back.
+
+    Speaks a short confirmation and, on success, also sends the smb:// address
+    as text so the user can read/type it into their iPhone's Files app.
+    """
+    try:
+        result = await enable_smb_share(folder or "~/Documents")
+    except Exception as e:
+        log.error(f"Share files failed: {e}")
+        result = {
+            "success": False,
+            "confirmation": "I ran into a problem setting up file sharing, sir.",
+            "smb_url": None,
+        }
+
+    spoken = result.get("confirmation", "")
+    smb_url = result.get("smb_url")
+
+    audio = await synthesize_speech(strip_markdown_for_tts(spoken))
+    if ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            if audio:
+                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": spoken})
+            else:
+                await ws.send_json({"type": "text", "text": spoken})
+            # Surface the smb:// address as text — it's easier to read than hear.
+            if smb_url:
+                await ws.send_json({"type": "text", "text": smb_url})
+            await ws.send_json({"type": "status", "state": "idle"})
+        except Exception as e:
+            log.error(f"Share files report failed: {e}")
+
+    if history is not None:
+        note = spoken + (f" ({smb_url})" if smb_url else "")
+        history.append({"role": "assistant", "content": f"[File sharing]: {note}"})
 
 
 def _find_project_dir(project_name: str) -> str | None:
@@ -2349,6 +2391,9 @@ async def voice_handler(ws: WebSocket):
                                         asyncio.create_task(create_apple_note("JARVIS Note", target))
                                 elif embedded_action["action"] == "screen":
                                     asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
+                                elif embedded_action["action"] == "share_files":
+                                    folder = embedded_action["target"].strip() or "~/Documents"
+                                    asyncio.create_task(_execute_share_files(folder, ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "read_note":
                                     # Read note in background and report back
                                     async def _read_and_report(search_term, _ws):
